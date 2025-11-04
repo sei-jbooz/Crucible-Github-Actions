@@ -119,6 +119,7 @@ runs:
       working-directory: helm-charts
       env:
         GH_TOKEN: ${{ inputs.helm_repo_token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
+        GH_REPO: ${{ inputs.helm_repo }}
         BRANCH: ${{ steps.update.outputs.branch_name }}
         APP_NAME: ${{ inputs.app_name }}
         APP_VERSION: ${{ steps.update.outputs.new_app_version }}

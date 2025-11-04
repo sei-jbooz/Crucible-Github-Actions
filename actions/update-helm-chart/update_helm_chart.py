@@ -220,7 +220,7 @@ def handle_update(args: argparse.Namespace) -> int:
             args.app_name, result.new_app_version, args.release_tag
         )
 
-    has_changes = result.chart_modified or bool(parent_updates)
+    has_changes = result.chart_modified or bool(parent_update)
 
     result_payload: Dict[str, Any] = {
         "old_app_version": result.old_app_version,
