@@ -28,7 +28,7 @@ The action:
 | `chart_file` | ✅ | Path to the application's `Chart.yaml` within the Helm repo, e.g. `charts/topomojo/charts/topomojo-api/Chart.yaml`. |
 | `parent_chart_file` |  | Optional path to a parent `Chart.yaml` that should be bumped. |
 | `helm_repo` |  | Helm charts repo (`cmu-sei/helm-charts` by default). |
-| `helm_repo_token` | ✅ | Token with `repo` scope that can push to the Helm charts repo. |
+| `helm_repo_token` |  | Optional token override; if omitted the action uses `HELM_REPO_TOKEN`/`GH_TOKEN` from the environment. |
 | `git_user_name` |  | Commit author name (`crucible-bot`). |
 | `git_user_email` |  | Commit author email (`crucible-bot@users.noreply.github.com`). |
 
@@ -58,21 +58,33 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Mint Helm charts token
+        id: helm-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.HELM_APP_ID }}
+          private-key: ${{ secrets.HELM_APP_PRIVATE_KEY }}
+          owner: cmu-sei
+          repositories: helm-charts
+
       - name: Update Helm chart
         uses: cmu-sei/crucible-github-actions/actions/update-helm-chart@v1
+        env:
+          HELM_REPO_TOKEN: ${{ steps.helm-token.outputs.token }}
         with:
           app_name: TopoMojo API
           release_tag: ${{ github.event.release.tag_name }}
           chart_file: charts/topomojo/charts/topomojo-api/Chart.yaml
           parent_chart_file: charts/topomojo/Chart.yaml
-          helm_repo_token: ${{ secrets.HELM_CHARTS_TOKEN }}
 ```
 
 ### Repository Configuration Checklist
 
-1. **Create a GitHub App or PAT** for pushing to `cmu-sei/helm-charts`.
-   - Required scopes: `repo` (full) or `contents:write`, `pull_request:write`.
-   - Store it as a secret (e.g. `HELM_CHARTS_TOKEN`) in the application repository or shared organization secret.
+1. **Create credentials** for pushing to `cmu-sei/helm-charts`.
+   - Preferred: register a GitHub App with `contents:write` and `pull_request:write`, install it on `cmu-sei/helm-charts`, and store the app ID and private key as repository secrets (`HELM_APP_ID`, `HELM_APP_PRIVATE_KEY`). The workflow also supplies the app owner (`cmu-sei`) and repository (`helm-charts`) to the official token action.
+   - Alternative: use a fine-grained PAT limited to the Helm charts repo and store as `HELM_CHARTS_TOKEN`; expose it to the workflow as `HELM_REPO_TOKEN` (or pass it via the optional `helm_repo_token` input if preferred).
+
+`with` passes explicit inputs to the composite action (e.g., `app_name` or `chart_file`), whereas `env` sets environment variables that the step can read—handy when shell commands or multiple actions need the same token. In the example above the minted token is made available as `HELM_REPO_TOKEN`; the composite action automatically picks it up without an explicit `with` value.
 2. **Add the workflow** (example above) to the application repository.
    - Trigger on `release` with `types: [published]`.
    - Ensure the workflow specifies `permissions.contents: write` and `permissions.pull-requests: write`.

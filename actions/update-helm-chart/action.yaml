@@ -21,8 +21,9 @@ inputs:
     required: false
     default: "cmu-sei/helm-charts"
   helm_repo_token:
-    description: "Token with push and PR permissions for the Helm charts repository."
-    required: true
+    description: "Token with push and PR permissions for the Helm charts repository. Optional if GH_TOKEN or HELM_REPO_TOKEN env vars are set."
+    required: false
+    default: ""
   git_user_name:
     description: "Git username for commits."
     required: false
@@ -61,7 +62,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: ${{ inputs.helm_repo }}
-        token: ${{ inputs.helm_repo_token }}
+        token: ${{ inputs.helm_repo_token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
         path: helm-charts
         ref: main
 
@@ -117,7 +118,7 @@ runs:
       if: steps.update.outputs.has_changes == 'true'
       working-directory: helm-charts
       env:
-        GH_TOKEN: ${{ inputs.helm_repo_token }}
+        GH_TOKEN: ${{ inputs.helm_repo_token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
         BRANCH: ${{ steps.update.outputs.branch_name }}
         APP_NAME: ${{ inputs.app_name }}
         APP_VERSION: ${{ steps.update.outputs.new_app_version }}
