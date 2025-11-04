@@ -1,0 +1,137 @@
+name: Update Helm Chart
+
+description: "Updates a Helm chart's app version, bumps chart versions, and opens a PR in the helm-charts repository."
+
+inputs:
+  app_name:
+    description: "Display name of the application (used in PR title and commit message)."
+    required: true
+  release_tag:
+    description: "Release tag that triggered the workflow (e.g. v2.5.2)."
+    required: true
+  chart_file:
+    description: "Path (within the helm-charts repo) to the Chart.yaml for the application."
+    required: true
+  parent_chart_file:
+    description: "Optional path to a parent Chart.yaml to bump."
+    required: false
+    default: ""
+  helm_repo:
+    description: "Target Helm charts repository."
+    required: false
+    default: "cmu-sei/helm-charts"
+  helm_repo_token:
+    description: "Token with push and PR permissions for the Helm charts repository. Optional if GH_TOKEN or HELM_REPO_TOKEN env vars are set."
+    required: false
+    default: ""
+  git_user_name:
+    description: "Git username for commits."
+    required: false
+    default: "crucible-bot"
+  git_user_email:
+    description: "Git user email for commits."
+    required: false
+    default: "crucible-bot@users.noreply.github.com"
+outputs:
+  new_app_version:
+    description: "Normalized application version extracted from the release tag."
+    value: ${{ steps.update.outputs.new_app_version }}
+  release_type:
+    description: "Release type used when bumping chart versions."
+    value: ${{ steps.update.outputs.release_type }}
+  new_chart_version:
+    description: "Updated chart version after the bump."
+    value: ${{ steps.update.outputs.new_chart_version }}
+  parent_chart_update:
+    description: "JSON payload describing the parent chart version change, when applicable."
+    value: ${{ steps.update.outputs.parent_chart_update }}
+  chart_modified:
+    description: "True when the application chart required modifications."
+    value: ${{ steps.update.outputs.chart_modified }}
+  branch_name:
+    description: "Branch name suggested for the Helm charts pull request."
+    value: ${{ steps.update.outputs.branch_name }}
+  has_changes:
+    description: "True when any chart files were updated."
+    value: ${{ steps.update.outputs.has_changes }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Helm charts repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.helm_repo }}
+        token: ${{ inputs.helm_repo_token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
+        path: helm-charts
+        ref: main
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.x"
+
+    - name: Install Python dependencies
+      run: |
+        python3 -m pip install --upgrade pip
+        python3 -m pip install pyyaml
+      shell: bash
+
+    - name: Update Helm chart metadata
+      id: update
+      run: |
+        python3 "${{ github.action_path }}/update_helm_chart.py" \
+          --helm-repo-dir "helm-charts" \
+          --chart-file "${{ inputs.chart_file }}" \
+          --parent-chart-file "${{ inputs.parent_chart_file }}" \
+          --release-tag "${{ inputs.release_tag }}" \
+          --app-name "${{ inputs.app_name }}" \
+          --github-output "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Create feature branch
+      if: steps.update.outputs.has_changes == 'true'
+      working-directory: helm-charts
+      run: git checkout -b "${{ steps.update.outputs.branch_name }}"
+      shell: bash
+
+    - name: Commit changes
+      if: steps.update.outputs.has_changes == 'true'
+      working-directory: helm-charts
+      env:
+        APP_NAME: ${{ inputs.app_name }}
+        APP_VERSION: ${{ steps.update.outputs.new_app_version }}
+      run: |
+        git config user.name "${{ inputs.git_user_name }}"
+        git config user.email "${{ inputs.git_user_email }}"
+        git add -A
+        git commit -m "chore: update ${APP_NAME} chart to ${APP_VERSION}"
+      shell: bash
+
+    - name: Push branch
+      if: steps.update.outputs.has_changes == 'true'
+      working-directory: helm-charts
+      run: git push --set-upstream origin "${{ steps.update.outputs.branch_name }}"
+      shell: bash
+
+    - name: Create pull request
+      if: steps.update.outputs.has_changes == 'true'
+      working-directory: helm-charts
+      env:
+        GH_TOKEN: ${{ inputs.helm_repo_token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
+        BRANCH: ${{ steps.update.outputs.branch_name }}
+        APP_NAME: ${{ inputs.app_name }}
+        APP_VERSION: ${{ steps.update.outputs.new_app_version }}
+        RELEASE_TYPE: ${{ steps.update.outputs.release_type }}
+      run: |
+        PR_BODY="Automated update for ${APP_NAME} to version ${APP_VERSION}."
+        if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+          echo "Pull request already exists for branch ${BRANCH}. Skipping creation."
+        else
+          gh pr create \
+            --title "${APP_NAME} to ${APP_VERSION}" \
+            --body "$PR_BODY" \
+            --base "main" \
+            --head "$BRANCH"
+        fi
+      shell: bash
