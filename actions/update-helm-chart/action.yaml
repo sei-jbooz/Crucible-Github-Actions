@@ -105,7 +105,7 @@ runs:
         git config user.name "${{ inputs.git_user_name }}"
         git config user.email "${{ inputs.git_user_email }}"
         git add -A
-        git commit -m "chore: update ${APP_NAME} chart to ${APP_VERSION}"
+        git commit -m "update ${APP_NAME} chart to ${APP_VERSION}"
       shell: bash
 
     - name: Push branch
