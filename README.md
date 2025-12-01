@@ -24,12 +24,12 @@ The action:
 | Name | Required | Description |
 | --- | --- | --- |
 | `github_app_name` | ✅ | Friendly name used for commit and PR title, e.g. `TopoMojo API`. |
+| `github_app_id` | ✅ | Optional GitHub App ID that should mint a token for pushing to the Helm repo. Provide via a secret. |
+| `github_app_private_key` | ✅ | Private key for the GitHub App. Provide via a secret. |
 | `chart_file` | ✅ | Path to the application's `Chart.yaml` within the Helm repo, e.g. `charts/topomojo/charts/topomojo-api/Chart.yaml`. |
 | `release_tag` |  | Tag from the calling workflow (defaults to `${{ github.event.release.tag_name }}`). |
 | `parent_chart_file` |  | Optional path to a parent `Chart.yaml` that should be bumped. |
 | `helm_chart_repo` |  | Helm charts repo (`cmu-sei/helm-charts` by default). |
-| `github_app_id` |  | Optional GitHub App ID that should mint a token for pushing to the Helm repo (defaults to `${{ secrets.CRUCIBLE_HELM_UPDATE_APP_ID }}` if present). |
-| `github_app_private_key` |  | Private key for the GitHub App (defaults to `${{ secrets.CRUCIBLE_HELM_UPDATE_PRIVATE_KEY }}`). |
 | `helm_repo_token` |  | Optional token override; if omitted the action uses `HELM_REPO_TOKEN`/`GH_TOKEN` from the environment. |
 | `git_user_name` |  | Commit author name (`github-actions[bot]`). |
 | `git_user_email` |  | Commit author email (`41898282+github-actions[bot]@users.noreply.github.com`). |

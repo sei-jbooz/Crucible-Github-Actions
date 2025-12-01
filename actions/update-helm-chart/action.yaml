@@ -6,6 +6,12 @@ inputs:
   github_app_name:
     description: "Display name of the application (used in PR title and commit message)."
     required: true
+  github_app_id:
+    description: "Optional GitHub App ID used to mint a token for the Helm repo."
+    required: true
+  github_app_private_key:
+    description: "Private key for the GitHub App when minting a token."
+    required: true
   chart_file:
     description: "Path (within the helm-charts repo) to the Chart.yaml for the application."
     required: true
@@ -17,14 +23,6 @@ inputs:
     description: "Target Helm charts repository."
     required: false
     default: "cmu-sei/helm-charts"
-  github_app_id:
-    description: "Optional GitHub App ID used to mint a token for the Helm repo."
-    required: false
-    default: ${{ secrets.CRUCIBLE_HELM_UPDATE_APP_ID }}
-  github_app_private_key:
-    description: "Private key for the GitHub App when minting a token."
-    required: false
-    default: ${{ secrets.CRUCIBLE_HELM_UPDATE_PRIVATE_KEY }}
   release_tag:
     description: "Release tag that triggered the workflow (e.g. v2.5.2)."
     required: false
@@ -87,12 +85,12 @@ runs:
     - name: Mint Helm charts app token
       id: mint_token
       if: >
-        (inputs.github_app_id != '' || env.HELM_APP_ID != '') &&
-        (inputs.github_app_private_key != '' || env.HELM_APP_PRIVATE_KEY != '')
+        (inputs.github_app_id != '') &&
+        (inputs.github_app_private_key != '')
       uses: actions/create-github-app-token@v1
       with:
-        app-id: ${{ inputs.github_app_id || env.HELM_APP_ID }}
-        private-key: ${{ inputs.github_app_private_key || env.HELM_APP_PRIVATE_KEY }}
+        app-id: ${{ inputs.github_app_id }}
+        private-key: ${{ inputs.github_app_private_key }}
         owner: ${{ steps.repo_meta.outputs.owner }}
         repositories: ${{ steps.repo_meta.outputs.name }}
 
@@ -100,7 +98,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: ${{ inputs.helm_chart_repo }}
-        token: ${{ inputs.helm_repo_token || steps.mint_token.outputs.token || env.HELM_REPO_TOKEN || env.GH_TOKEN || github.token }}
+        token: ${{ inputs.helm_repo_token || steps.mint_token.outputs.token || env.GH_TOKEN || github.token }}
         path: helm-charts
         ref: main
 
