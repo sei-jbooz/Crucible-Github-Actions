@@ -308,30 +308,30 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 | `buildArgs` |  | Optional Docker build args (newline-separated `key=value`). |
 | `platforms` |  | Comma-separated target platforms; default `linux/amd64,linux/arm64`. |
 | `preBuildCommands` |  | Optional shell commands to run before the Docker build (e.g., fetch artifacts). |
-| `smokeTest` |  | Run a startup smoke test after building the default stage; default `true`. |
-| `smokeTestPath` |  | Health endpoint path to check (must start with `/`). Empty means try the default list. |
-| `smokeTestEnv` |  | Additional environment variables for the smoke test (newline-separated `KEY=VALUE`, applied after defaults). |
+| `startupTest` |  | Run a startup test after building the default stage; default `true`. |
+| `startupTestPath` |  | Health endpoint path to check (must start with `/`). Empty means try the default list. |
+| `startupTestEnv` |  | Additional environment variables for the startup test (newline-separated `KEY=VALUE`, applied after defaults). |
 
-#### Startup smoke test
+#### Startup test
 
-The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
+The workflow runs a startup test by default (`startupTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
 
-The app runs with these environment variables (in this order), then `smokeTestEnv`:
+The app runs with these environment variables (in this order), then `startupTestEnv`:
 
 - `Database__Provider=PostgreSQL`
-- `ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=smoketest;Username=postgres;Password=smoketest`
+- `ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest`
 - `Database__ConnectionString=` (same connection string)
 - `Oidc__RequireHttpsMetadata=false`
-- `GameEngine__ClientId=smoketest`
-- `GameEngine__ClientSecret=smoketest`
+- `GameEngine__ClientId=startuptest`
+- `GameEngine__ClientSecret=startuptest`
 
-The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `smokeTestPath` is set, only that path is checked; otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` and succeeds on the first 200.
+The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `startupTestPath` is set, only that path is checked; otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` and succeeds on the first 200.
 
 UIs whose nginx falls back to `index.html` answer 200 on any path, so any listed path can satisfy the check.
 
-On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` images (such as `debug`) are not smoke tested.
+On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` images (such as `debug`) are not tested.
 
-Opt out by setting `smokeTest: false` when the image exits by design, needs services other than Postgres, listens on a port other than its lowest EXPOSEd TCP port (or 8080 with no EXPOSE), or needs more than 120 seconds to start:
+Opt out by setting `startupTest: false` when the image exits by design, needs services other than Postgres, listens on a port other than its lowest EXPOSEd TCP port (or 8080 with no EXPOSE), or needs more than 120 seconds to start:
 
 ```yaml
 jobs:
@@ -339,7 +339,7 @@ jobs:
     uses: cmu-sei/Crucible-Github-Actions/.github/workflows/docker-build.yaml@docker-v1
     with:
       imageName: cmusei/myapp
-      smokeTest: false
+      startupTest: false
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}

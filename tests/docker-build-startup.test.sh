@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests the smoke_test step of .github/workflows/docker-build.yaml, which
+# Tests the startup_test step of .github/workflows/docker-build.yaml, which
 # starts a Postgres container and the built image, then polls the health
 # endpoints. Extracts the step's `run:` body and runs it locally against
 # stubbed docker and curl commands, checking all validation, port detection,
@@ -25,9 +25,9 @@ extract_step() {
   ' "$1" | sed -e 's/^          //'
 }
 
-extract_step "$WORKFLOW" smoke_test > "$TMP/smoke.sh"
-if ! grep -q 'IMAGE' "$TMP/smoke.sh"; then
-  echo "FAIL extract smoke_test step (empty or polluted extraction)"; exit 1
+extract_step "$WORKFLOW" startup_test > "$TMP/startup.sh"
+if ! grep -q 'IMAGE' "$TMP/startup.sh"; then
+  echo "FAIL extract startup_test step (empty or polluted extraction)"; exit 1
 fi
 
 pass=0; fail=0
@@ -39,9 +39,9 @@ mkdir -p "$TMP/bin"
 # Stub: docker logs all invocations; image inspect returns $FAKE_EXPOSED (or
 # prints $FAKE_INSPECT_ERR to stderr and exits $FAKE_INSPECT_RC when non-zero);
 # pull exits $FAKE_PULL_RC (prints $FAKE_PULL_ERR); exec ... pg_isready exits
-# $FAKE_PG_RC; run ... smoke-app exits $FAKE_RUN_RC (prints $FAKE_RUN_ERR to
+# $FAKE_PG_RC; run ... startup-test-app exits $FAKE_RUN_RC (prints $FAKE_RUN_ERR to
 # stderr when non-zero); the Postgres run exits $FAKE_PG_RUN_RC (prints
-# $FAKE_PG_RUN_ERR); inspect -f on smoke-app pops a line from $TMP/states
+# $FAKE_PG_RUN_ERR); inspect -f on startup-test-app pops a line from $TMP/states
 # (repeats last); logs prints marker; rm succeeds.
 cat > "$TMP/bin/docker" << 'EOSTUB'
 #!/usr/bin/env bash
@@ -59,9 +59,9 @@ elif [[ "$1" == "pull" ]]; then
     echo "${FAKE_PULL_ERR:-}" >&2
   fi
   exit "$rc"
-elif [[ "$1" == "exec" && "$2" == "smoke-postgres" && "$3" == "pg_isready" ]]; then
+elif [[ "$1" == "exec" && "$2" == "startup-test-postgres" && "$3" == "pg_isready" ]]; then
   exit "${FAKE_PG_RC:-0}"
-elif [[ "$1" == "run" && "$*" == *"smoke-app"* ]]; then
+elif [[ "$1" == "run" && "$*" == *"startup-test-app"* ]]; then
   rc="${FAKE_RUN_RC:-0}"
   if [[ "$rc" != 0 ]]; then
     echo "${FAKE_RUN_ERR:-}" >&2
@@ -74,7 +74,7 @@ elif [[ "$1" == "run" ]]; then
     echo "${FAKE_PG_RUN_ERR:-}" >&2
   fi
   exit "$rc"
-elif [[ "$1" == "inspect" && "$*" == *"smoke-app"* ]]; then
+elif [[ "$1" == "inspect" && "$*" == *"startup-test-app"* ]]; then
   if [[ -f "$TMP/states" && -s "$TMP/states" ]]; then
     state="$(head -n1 "$TMP/states")"
     tail -n +2 "$TMP/states" > "$TMP/states.tmp" || true
@@ -140,13 +140,13 @@ fi
 EOSTUB
 chmod +x "$TMP/bin/sleep"
 
-# run_smoke VAR=value ... -> runs the smoke script with defaults
-run_smoke() {
+# run_startup VAR=value ... -> runs the startup script with defaults
+run_startup() {
   : > "$TMP/docker.log"
   : > "$TMP/curl.log"
   : > "$TMP/curl.args"
   mkdir -p "$TMP/rt"
-  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-6}" SMOKE_POLL_SECONDS="${SMOKE_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" FAKE_INSPECT_RC="${FAKE_INSPECT_RC:-}" FAKE_INSPECT_ERR="${FAKE_INSPECT_ERR:-}" FAKE_PULL_RC="${FAKE_PULL_RC:-}" FAKE_PULL_ERR="${FAKE_PULL_ERR:-}" FAKE_PG_RUN_RC="${FAKE_PG_RUN_RC:-}" FAKE_PG_RUN_ERR="${FAKE_PG_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
+  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img STARTUP_TEST_TIMEOUT_SECONDS="${STARTUP_TEST_TIMEOUT_SECONDS:-6}" STARTUP_TEST_POLL_SECONDS="${STARTUP_TEST_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 STARTUP_TEST_PATH="${STARTUP_TEST_PATH:-}" STARTUP_TEST_ENV="${STARTUP_TEST_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" FAKE_INSPECT_RC="${FAKE_INSPECT_RC:-}" FAKE_INSPECT_ERR="${FAKE_INSPECT_ERR:-}" FAKE_PULL_RC="${FAKE_PULL_RC:-}" FAKE_PULL_ERR="${FAKE_PULL_ERR:-}" FAKE_PG_RUN_RC="${FAKE_PG_RUN_RC:-}" FAKE_PG_RUN_ERR="${FAKE_PG_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/startup.sh") > "$ERR" 2>&1
   rc=$?
 }
 
@@ -169,7 +169,7 @@ output_lacks() { ! grep -qF -- "$1" "$ERR"; }
 
 # port from ExposedPorts
 t() {
-  FAKE_EXPOSED='{"80/tcp":{}}' run_smoke
+  FAKE_EXPOSED='{"80/tcp":{}}' run_startup
   [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80" && curl_log_has "http://127.0.0.1:80/api/health/ready" && output_has "port 80"
 }
 setup_codes() {
@@ -183,7 +183,7 @@ check "port from ExposedPorts" t
 
 # lowest of several ports
 t() {
-  FAKE_EXPOSED='{"443/tcp":{},"80/tcp":{}}' run_smoke
+  FAKE_EXPOSED='{"443/tcp":{},"80/tcp":{}}' run_startup
   [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80"
 }
 setup_codes; setup_states
@@ -191,7 +191,7 @@ check "lowest of several ports" t
 
 # udp-only falls back to 8080
 t() {
-  FAKE_EXPOSED='{"53/udp":{}}' run_smoke
+  FAKE_EXPOSED='{"53/udp":{}}' run_startup
   [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:8080:8080"
 }
 setup_codes; setup_states
@@ -199,7 +199,7 @@ check "udp-only falls back to 8080" t
 
 # no ExposedPorts falls back to 8080
 t() {
-  FAKE_EXPOSED='null' run_smoke
+  FAKE_EXPOSED='null' run_startup
   [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:8080:8080"
 }
 setup_codes; setup_states
@@ -207,23 +207,23 @@ check "no ExposedPorts falls back to 8080" t
 
 # network namespace
 t() {
-  run_smoke
-  docker_log_has "--network container:smoke-postgres" && ! docker_log_has "--network host"
+  run_startup
+  docker_log_has "--network container:startup-test-postgres" && ! docker_log_has "--network host"
 }
 setup_codes; setup_states
 check "network namespace" t
 
 # default env then caller env
 t() {
-  SMOKE_ENV=$'Database__Provider=Sqlite\nFoo__Bar=1' run_smoke
+  STARTUP_TEST_ENV=$'Database__Provider=Sqlite\nFoo__Bar=1' run_startup
   [[ "$rc" = 0 ]] &&
-  env_file="$(cat "$TMP/rt/smoke-test.env")" &&
+  env_file="$(cat "$TMP/rt/startup-test.env")" &&
   [[ "$(echo "$env_file" | head -n1)" == "Database__Provider=PostgreSQL" ]] &&
   [[ "$(echo "$env_file" | sed -n '2p')" =~ ^ConnectionStrings__PostgreSQL= ]] &&
   [[ "$(echo "$env_file" | sed -n '3p')" =~ ^Database__ConnectionString= ]] &&
   [[ "$(echo "$env_file" | sed -n '4p')" == "Oidc__RequireHttpsMetadata=false" ]] &&
-  [[ "$(echo "$env_file" | sed -n '5p')" == "GameEngine__ClientId=smoketest" ]] &&
-  [[ "$(echo "$env_file" | sed -n '6p')" == "GameEngine__ClientSecret=smoketest" ]] &&
+  [[ "$(echo "$env_file" | sed -n '5p')" == "GameEngine__ClientId=startuptest" ]] &&
+  [[ "$(echo "$env_file" | sed -n '6p')" == "GameEngine__ClientSecret=startuptest" ]] &&
   [[ "$(echo "$env_file" | sed -n '7p')" == "Database__Provider=Sqlite" ]] &&
   [[ "$(echo "$env_file" | sed -n '8p')" == "Foo__Bar=1" ]]
 }
@@ -232,9 +232,9 @@ check "default env then caller env" t
 
 # CRLF and blank lines in env
 t() {
-  SMOKE_ENV=$'A=1\r\n\r\nB=2\r\n' run_smoke
+  STARTUP_TEST_ENV=$'A=1\r\n\r\nB=2\r\n' run_startup
   [[ "$rc" = 0 ]] &&
-  env_file="$(cat "$TMP/rt/smoke-test.env")" &&
+  env_file="$(cat "$TMP/rt/startup-test.env")" &&
   echo "$env_file" | grep -qF "A=1" &&
   echo "$env_file" | grep -qF "B=2" &&
   ! echo "$env_file" | grep -q $'\r'
@@ -244,14 +244,14 @@ check "CRLF and blank lines in env" t
 
 # invalid env line not echoed
 t() {
-  SMOKE_ENV=$'A=1\nexport SECRETVALUE=x' run_smoke
+  STARTUP_TEST_ENV=$'A=1\nexport SECRETVALUE=x' run_startup
   [[ "$rc" != 0 ]] && output_has "line 2" && output_lacks "SECRETVALUE" && ! docker_log_has "run "
 }
 check "invalid env line not echoed" t
 
 # explicit path
 t() {
-  SMOKE_PATH=/api/x run_smoke
+  STARTUP_TEST_PATH=/api/x run_startup
   [[ "$rc" = 0 ]] && curl_log_has "http://127.0.0.1:8080/api/x" &&
   ! curl_log_has "/api/health/ready"
 }
@@ -263,21 +263,21 @@ check "explicit path" t
 
 # path without leading slash rejected
 t() {
-  SMOKE_PATH=api/x run_smoke
+  STARTUP_TEST_PATH=api/x run_startup
   [[ "$rc" != 0 ]] && ! docker_log_has "run "
 }
 check "path without leading slash rejected" t
 
 # path with space rejected before docker run
 t() {
-  SMOKE_PATH='/api/x y' run_smoke
+  STARTUP_TEST_PATH='/api/x y' run_startup
   [[ "$rc" != 0 ]] && output_has "invalid characters" && ! docker_log_has "run "
 }
 check "path with space rejected before docker run" t
 
 # path with bracket accepted and curl called with --globoff
 t() {
-  SMOKE_PATH='/api/x[0]' run_smoke
+  STARTUP_TEST_PATH='/api/x[0]' run_startup
   [[ "$rc" = 0 ]] && curl_log_has "http://127.0.0.1:8080/api/x[0]" &&
   grep -qF -- '--globoff' "$TMP/curl.args"
 }
@@ -289,7 +289,7 @@ check "path with bracket accepted and curl called with --globoff" t
 
 # default list fallback
 t() {
-  run_smoke
+  run_startup
   [[ "$rc" = 0 ]] &&
   curl_log_has "/api/health/ready" &&
   curl_log_has "/api/health/version" &&
@@ -299,7 +299,7 @@ t() {
   version_line="$(grep -n "/api/health/version" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
   status_line="$(grep -n "/api/status" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
   [[ "$ready_line" -lt "$status_line" ]] && [[ "$version_line" -lt "$status_line" ]] &&
-  output_has "Smoke test passed: /api/status returned 200 on port"
+  output_has "Startup test passed: /api/status returned 200 on port"
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 000
@@ -311,7 +311,7 @@ check "default list fallback" t
 
 # 503 keeps polling
 t() {
-  run_smoke
+  run_startup
   curl_rounds="$(wc -l < "$TMP/curl.log")"
   # At 6s timeout, 2s poll: 3 rounds * 4 paths = 12 attempts minimum
   [[ "$rc" != 0 ]] && output_has "last status:" && output_has "/api/health/ready=503" && [[ "$curl_rounds" -ge 12 ]]
@@ -327,7 +327,7 @@ check "503 keeps polling" t
 
 # timeout message with last code per path
 t() {
-  run_smoke
+  run_startup
   [[ "$rc" != 0 ]] && output_has "last status: /api/health/ready=503 /api/health/version=404 /api/status=404 /=404"
 }
 cat > "$TMP/codes" << EOF
@@ -341,7 +341,7 @@ check "timeout message with last code per path" t
 
 # timeout with 000 codes included
 t() {
-  run_smoke
+  run_startup
   [[ "$rc" != 0 ]] && output_has "last status:" && output_has "/api/health/ready=000" && output_has "/api/health/version=000"
 }
 : > "$TMP/codes"
@@ -353,9 +353,9 @@ check "timeout with 000 codes included" t
 # is reached after about 3 rounds (12 curls), short of the 4 rounds (16 curls)
 # the round count alone would allow.
 t() {
-  SMOKE_TIMEOUT_SECONDS=4 SMOKE_POLL_SECONDS=1 FAKE_SLEEP_SECONDS=2.5 run_smoke
+  STARTUP_TEST_TIMEOUT_SECONDS=4 STARTUP_TEST_POLL_SECONDS=1 FAKE_SLEEP_SECONDS=2.5 run_startup
   curl_count="$(wc -l < "$TMP/curl.log")"
-  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Timeout waiting for healthy response" &&
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Timeout waiting for healthy response" &&
   [[ "$curl_count" -ge 4 ]] && [[ "$curl_count" -lt 16 ]]
 }
 : > "$TMP/codes"
@@ -364,7 +364,7 @@ check "deadline stops loop before max rounds" t
 
 # exited container fails fast
 t() {
-  run_smoke
+  run_startup
   [[ "$rc" != 0 ]] && output_has "135" && output_has "APP-LOG-MARKER" &&
   curl_count="$(wc -l < "$TMP/curl.log" || echo 0)" &&
   [[ "$curl_count" -le 4 ]]
@@ -375,27 +375,27 @@ check "exited container fails fast" t
 
 # docker run fails
 t() {
-  FAKE_RUN_RC=125 FAKE_RUN_ERR='exec format error' run_smoke
+  FAKE_RUN_RC=125 FAKE_RUN_ERR='exec format error' run_startup
   [[ "$rc" != 0 ]] && output_has "exec format error" &&
   tail -1 "$TMP/docker.log" | grep -qF "rm -f" &&
-  tail -1 "$TMP/docker.log" | grep -qF "smoke-app" &&
-  tail -1 "$TMP/docker.log" | grep -qF "smoke-postgres"
+  tail -1 "$TMP/docker.log" | grep -qF "startup-test-app" &&
+  tail -1 "$TMP/docker.log" | grep -qF "startup-test-postgres"
 }
 check "docker run fails" t
 
 # image inspect fails: annotation plus docker's error text, not swallowed into the JSON value
 t() {
-  FAKE_INSPECT_RC=1 FAKE_INSPECT_ERR='Error: No such image: smoke-test:local' run_smoke
-  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to inspect image" &&
-  output_has "Error: No such image: smoke-test:local" &&
+  FAKE_INSPECT_RC=1 FAKE_INSPECT_ERR='Error: No such image: startup-test:local' run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Failed to inspect image" &&
+  output_has "Error: No such image: startup-test:local" &&
   ! docker_log_has "pull " && ! docker_log_has "run " && docker_log_has "rm -f"
 }
 check "image inspect fails with annotation and docker error" t
 
 # Postgres pull fails
 t() {
-  FAKE_PULL_RC=1 FAKE_PULL_ERR='toomanyrequests: rate limit' run_smoke
-  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to pull Postgres image" &&
+  FAKE_PULL_RC=1 FAKE_PULL_ERR='toomanyrequests: rate limit' run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Failed to pull Postgres image" &&
   output_has "toomanyrequests: rate limit" &&
   ! docker_log_has "run " && tail -1 "$TMP/docker.log" | grep -qF "rm -f"
 }
@@ -403,31 +403,31 @@ check "postgres pull fails with annotation" t
 
 # Postgres run fails
 t() {
-  FAKE_PG_RUN_RC=125 FAKE_PG_RUN_ERR='port is already allocated' run_smoke
-  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to start Postgres container" &&
+  FAKE_PG_RUN_RC=125 FAKE_PG_RUN_ERR='port is already allocated' run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Failed to start Postgres container" &&
   output_has "port is already allocated" &&
-  ! docker_log_has "--name smoke-app" && tail -1 "$TMP/docker.log" | grep -qF "rm -f"
+  ! docker_log_has "--name startup-test-app" && tail -1 "$TMP/docker.log" | grep -qF "rm -f"
 }
 check "postgres run fails with annotation" t
 
 # postgres never ready
 t() {
-  FAKE_PG_RC=1 run_smoke
-  [[ "$rc" != 0 ]] && output_has "Postgres" && ! docker_log_has "--name smoke-app" && docker_log_has "rm -f"
+  FAKE_PG_RC=1 run_startup
+  [[ "$rc" != 0 ]] && output_has "Postgres" && ! docker_log_has "--name startup-test-app" && docker_log_has "rm -f"
 }
 check "postgres never ready" t
 
 # cleanup on success
 t() {
-  run_smoke
-  [[ "$rc" = 0 ]] && docker_log_has "rm -f" && docker_log_has "smoke-app" && docker_log_has "smoke-postgres"
+  run_startup
+  [[ "$rc" = 0 ]] && docker_log_has "rm -f" && docker_log_has "startup-test-app" && docker_log_has "startup-test-postgres"
 }
 setup_codes; setup_states
 check "cleanup on success" t
 
 # logs on timeout
 t() {
-  run_smoke
+  run_startup
   [[ "$rc" != 0 ]] && output_has "APP-LOG-MARKER" && output_has "::group::"
 }
 cat > "$TMP/codes" << EOF
@@ -438,8 +438,8 @@ check "logs on timeout" t
 
 # GitHub annotation
 t() {
-  run_smoke
-  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::"
+  run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::"
 }
 echo "exited 135" > "$TMP/states"
 : > "$TMP/codes"
@@ -514,8 +514,8 @@ step_with_has() {
   [[ "$(step_with_value "$1" "$2" "${4:-$WORKFLOW}")" == "$3" ]]
 }
 
-SMOKE_BUILD='Build default stage for smoke test'
-SMOKE_STEP='Smoke test default stage'
+STARTUP_TEST_BUILD='Build default stage for startup test'
+STARTUP_TEST_STEP='Startup test default stage'
 PUSH_BUILD='Build (push by digest) default stage'
 NOPUSH_BUILD='Build (no push) default stage'
 
@@ -538,53 +538,53 @@ mutant() {
   inject_in_step "$1" "$2" "$3" "$WORKFLOW" > "$4" && ! cmp -s "$WORKFLOW" "$4"
 }
 
-# build_smoke exists with correct attributes
-build_smoke_attrs() {
+# build_startup_test exists with correct attributes
+build_startup_test_attrs() {
   local f="$1"
-  step_block "$SMOKE_BUILD" "$f" > /dev/null &&
-  [[ "$(step_field "$SMOKE_BUILD" 'id:' "$f")" == "build_smoke" ]] &&
-  [[ "$(step_field "$SMOKE_BUILD" 'if:' "$f")" == "inputs.smokeTest" ]] &&
-  step_with_has "$SMOKE_BUILD" 'load' 'true' "$f" &&
-  step_with_has "$SMOKE_BUILD" 'push' 'false' "$f" &&
-  step_with_has "$SMOKE_BUILD" 'tags' 'smoke-test:local' "$f" &&
-  # No target: means additionalTarget is not used for smoke test
-  step_lacks_line "$SMOKE_BUILD" '          target:' "$f" &&
+  step_block "$STARTUP_TEST_BUILD" "$f" > /dev/null &&
+  [[ "$(step_field "$STARTUP_TEST_BUILD" 'id:' "$f")" == "build_startup_test" ]] &&
+  [[ "$(step_field "$STARTUP_TEST_BUILD" 'if:' "$f")" == "inputs.startupTest" ]] &&
+  step_with_has "$STARTUP_TEST_BUILD" 'load' 'true' "$f" &&
+  step_with_has "$STARTUP_TEST_BUILD" 'push' 'false' "$f" &&
+  step_with_has "$STARTUP_TEST_BUILD" 'tags' 'startup-test:local' "$f" &&
+  # No target: means additionalTarget is not used for startup test
+  step_lacks_line "$STARTUP_TEST_BUILD" '          target:' "$f" &&
   # cache-from scope matches default stage pattern
-  step_with_has "$SMOKE_BUILD" 'cache-from' "type=gha,scope=\${{ needs.prepare.outputs.image_slug }}-\${{ matrix.safe }}-default" "$f"
+  step_with_has "$STARTUP_TEST_BUILD" 'cache-from' "type=gha,scope=\${{ needs.prepare.outputs.image_slug }}-\${{ matrix.safe }}-default" "$f"
 }
-t() { build_smoke_attrs "$WORKFLOW"; }
-check "build_smoke exists with correct attributes" t
+t() { build_startup_test_attrs "$WORKFLOW"; }
+check "build_startup_test exists with correct attributes" t
 
-# mutant: target: under build_smoke's with: must fail the check
+# mutant: target: under build_startup_test's with: must fail the check
 t() {
-  mutant "$SMOKE_BUILD" '        with:' '          target: x' "$TMP/mut-target.yaml" &&
-  ! step_lacks_line "$SMOKE_BUILD" '          target:' "$TMP/mut-target.yaml" &&
-  ! build_smoke_attrs "$TMP/mut-target.yaml"
+  mutant "$STARTUP_TEST_BUILD" '        with:' '          target: x' "$TMP/mut-target.yaml" &&
+  ! step_lacks_line "$STARTUP_TEST_BUILD" '          target:' "$TMP/mut-target.yaml" &&
+  ! build_startup_test_attrs "$TMP/mut-target.yaml"
 }
-check "mutant: build_smoke with target: fails the attributes check" t
+check "mutant: build_startup_test with target: fails the attributes check" t
 
-# smoke_test has if: inputs.smokeTest
+# startup_test has if: inputs.startupTest
 t() {
-  [[ "$(step_field "$SMOKE_STEP" 'id:')" == "smoke_test" ]] &&
-  [[ "$(step_field "$SMOKE_STEP" 'if:')" == "inputs.smokeTest" ]]
+  [[ "$(step_field "$STARTUP_TEST_STEP" 'id:')" == "startup_test" ]] &&
+  [[ "$(step_field "$STARTUP_TEST_STEP" 'if:')" == "inputs.startupTest" ]]
 }
-check "smoke_test has if: inputs.smokeTest" t
+check "startup_test has if: inputs.startupTest" t
 
-# Step order: build_smoke < smoke_test < build_default_push
+# Step order: build_startup_test < startup_test < build_default_push
 t() {
-  build_smoke_line="$(grep -nxF -- "      - name: $SMOKE_BUILD" "$WORKFLOW" | cut -d: -f1)"
-  smoke_test_line="$(grep -nxF -- "      - name: $SMOKE_STEP" "$WORKFLOW" | cut -d: -f1)"
+  build_startup_test_line="$(grep -nxF -- "      - name: $STARTUP_TEST_BUILD" "$WORKFLOW" | cut -d: -f1)"
+  startup_test_line="$(grep -nxF -- "      - name: $STARTUP_TEST_STEP" "$WORKFLOW" | cut -d: -f1)"
   build_push_line="$(grep -nxF -- "      - name: $PUSH_BUILD" "$WORKFLOW" | cut -d: -f1)"
-  [[ -n "$build_smoke_line" ]] && [[ -n "$smoke_test_line" ]] && [[ -n "$build_push_line" ]] &&
-  [[ "$build_smoke_line" -lt "$smoke_test_line" ]] &&
-  [[ "$smoke_test_line" -lt "$build_push_line" ]]
+  [[ -n "$build_startup_test_line" ]] && [[ -n "$startup_test_line" ]] && [[ -n "$build_push_line" ]] &&
+  [[ "$build_startup_test_line" -lt "$startup_test_line" ]] &&
+  [[ "$startup_test_line" -lt "$build_push_line" ]]
 }
-check "step order: build_smoke < smoke_test < build_default_push" t
+check "step order: build_startup_test < startup_test < build_default_push" t
 
 # Build (no push) default stage has updated if:
 t() {
   if_cond="$(step_field "$NOPUSH_BUILD" 'if:')"
-  [[ "$if_cond" == "needs.prepare.outputs.push != 'true' && !inputs.smokeTest" ]]
+  [[ "$if_cond" == "needs.prepare.outputs.push != 'true' && !inputs.startupTest" ]]
 }
 check "Build (no push) default stage has updated if condition" t
 
@@ -617,30 +617,30 @@ t() {
 }
 check "no other step if: changed from origin/main" t
 
-# build_smoke and smoke_test have no continue-on-error
-t() { step_lacks_line "$SMOKE_BUILD" '        continue-on-error:'; }
-check "build_smoke has no continue-on-error" t
+# build_startup_test and startup_test have no continue-on-error
+t() { step_lacks_line "$STARTUP_TEST_BUILD" '        continue-on-error:'; }
+check "build_startup_test has no continue-on-error" t
 
-t() { step_lacks_line "$SMOKE_STEP" '        continue-on-error:'; }
-check "smoke_test has no continue-on-error" t
+t() { step_lacks_line "$STARTUP_TEST_STEP" '        continue-on-error:'; }
+check "startup_test has no continue-on-error" t
 
 # mutants: continue-on-error under each step must fail its check
 t() {
-  mutant "$SMOKE_BUILD" '' '        continue-on-error: true' "$TMP/mut-coe-build.yaml" &&
-  ! step_lacks_line "$SMOKE_BUILD" '        continue-on-error:' "$TMP/mut-coe-build.yaml"
+  mutant "$STARTUP_TEST_BUILD" '' '        continue-on-error: true' "$TMP/mut-coe-build.yaml" &&
+  ! step_lacks_line "$STARTUP_TEST_BUILD" '        continue-on-error:' "$TMP/mut-coe-build.yaml"
 }
-check "mutant: build_smoke continue-on-error fails the check" t
+check "mutant: build_startup_test continue-on-error fails the check" t
 
 t() {
-  mutant "$SMOKE_STEP" '' '        continue-on-error: true' "$TMP/mut-coe-smoke.yaml" &&
-  ! step_lacks_line "$SMOKE_STEP" '        continue-on-error:' "$TMP/mut-coe-smoke.yaml"
+  mutant "$STARTUP_TEST_STEP" '' '        continue-on-error: true' "$TMP/mut-coe-startup.yaml" &&
+  ! step_lacks_line "$STARTUP_TEST_STEP" '        continue-on-error:' "$TMP/mut-coe-startup.yaml"
 }
-check "mutant: smoke_test continue-on-error fails the check" t
+check "mutant: startup_test continue-on-error fails the check" t
 
-# continue-on-error on the step after smoke_test belongs to that step, not smoke_test
+# continue-on-error on the step after startup_test belongs to that step, not startup_test
 t() {
   mutant "$PUSH_BUILD" '' '        continue-on-error: true' "$TMP/mut-coe-next.yaml" &&
-  step_lacks_line "$SMOKE_STEP" '        continue-on-error:' "$TMP/mut-coe-next.yaml"
+  step_lacks_line "$STARTUP_TEST_STEP" '        continue-on-error:' "$TMP/mut-coe-next.yaml"
 }
 check "step block ends at the next step" t
 
@@ -651,20 +651,20 @@ t() {
 }
 check "missing step is distinct from missing key" t
 
-# build_smoke and build_default_push have identical build attributes
+# build_startup_test and build_default_push have identical build attributes
 t() {
-  local attr smoke push
+  local attr startup_test push
   for attr in context file platforms pull build-args labels cache-from cache-to; do
-    smoke="$(step_with_value "$SMOKE_BUILD" "$attr")"
+    startup_test="$(step_with_value "$STARTUP_TEST_BUILD" "$attr")"
     push="$(step_with_value "$PUSH_BUILD" "$attr")"
-    if [[ -z "$smoke" || "$smoke" != "$push" ]]; then
+    if [[ -z "$startup_test" || "$startup_test" != "$push" ]]; then
       echo "with.$attr differs or is missing" >&2
       return 1
     fi
   done
   return 0
 }
-check "build_smoke and build_default_push have identical build attributes" t
+check "build_startup_test and build_default_push have identical build attributes" t
 
-echo "docker-build-smoke: $pass passed, $fail failed"
+echo "docker-build-startup: $pass passed, $fail failed"
 [ "$fail" = 0 ]
