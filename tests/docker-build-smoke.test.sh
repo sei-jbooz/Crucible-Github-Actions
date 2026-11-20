@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# Tests the smoke_test step of .github/workflows/docker-build.yaml, which
+# starts a Postgres container and the built image, then polls the health
+# endpoints. Extracts the step's `run:` body and runs it locally against
+# stubbed docker and curl commands, checking all validation, port detection,
+# env handling, polling logic, and cleanup cases.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKFLOW="$ROOT/.github/workflows/docker-build.yaml"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Print the de-indented `run: |` body of the workflow step whose `id:` is $2
+# in workflow file $1 (steps at 6 spaces, keys at 8, run body at 10).
+extract_step() {
+  awk -v want="$2" '
+    /^      - / { in_step = 0 }
+    $0 ~ "^        id: " want "$" { in_step = 1; next }
+    in_step && /^        run: \|$/ { in_run = 1; next }
+    in_run {
+      if ($0 ~ /^      - / || ($0 !~ /^[[:space:]]*$/ && $0 !~ /^          /)) { exit }
+      print
+    }
+  ' "$1" | sed -e 's/^          //'
+}
+
+extract_step "$WORKFLOW" smoke_test > "$TMP/smoke.sh"
+if ! grep -q 'IMAGE' "$TMP/smoke.sh"; then
+  echo "FAIL extract smoke_test step (empty or polluted extraction)"; exit 1
+fi
+
+pass=0; fail=0
+ERR="$TMP/err"
+
+# Create stub directory
+mkdir -p "$TMP/bin"
+
+# Stub: docker logs all invocations; inspect -f '{{json .Config.ExposedPorts}}'
+# returns $FAKE_EXPOSED; exec ... pg_isready exits $FAKE_PG_RC; run ... smoke-app
+# exits $FAKE_RUN_RC (prints $FAKE_RUN_ERR to stderr when non-zero); inspect -f
+# on smoke-app pops a line from $TMP/states (repeats last); logs prints marker; rm succeeds.
+cat > "$TMP/bin/docker" << 'EOSTUB'
+#!/usr/bin/env bash
+echo "$*" >> "$TMP/docker.log"
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  echo "${FAKE_EXPOSED:-null}"
+elif [[ "$1" == "exec" && "$2" == "smoke-postgres" && "$3" == "pg_isready" ]]; then
+  exit "${FAKE_PG_RC:-0}"
+elif [[ "$1" == "run" && "$*" == *"smoke-app"* ]]; then
+  rc="${FAKE_RUN_RC:-0}"
+  if [[ "$rc" != 0 ]]; then
+    echo "${FAKE_RUN_ERR:-}" >&2
+  fi
+  exit "$rc"
+elif [[ "$1" == "run" ]]; then
+  # Postgres or other container - just succeed
+  exit 0
+elif [[ "$1" == "inspect" && "$*" == *"smoke-app"* ]]; then
+  if [[ -f "$TMP/states" && -s "$TMP/states" ]]; then
+    state="$(head -n1 "$TMP/states")"
+    tail -n +2 "$TMP/states" > "$TMP/states.tmp" || true
+    if [[ -s "$TMP/states.tmp" ]]; then
+      mv "$TMP/states.tmp" "$TMP/states"
+    else
+      # Last state repeats
+      echo "$state" > "$TMP/states"
+    fi
+    echo "$state"
+  else
+    echo "running"
+  fi
+elif [[ "$1" == "logs" ]]; then
+  echo "APP-LOG-MARKER"
+elif [[ "$1" == "rm" ]]; then
+  # cleanup succeeds
+  exit 0
+fi
+EOSTUB
+chmod +x "$TMP/bin/docker"
+
+# Stub: curl finds the URL argument, looks up its path in $TMP/codes (lines
+# "PATH CODE"), prints the code (default 000); appends URL to $TMP/curl.log.
+cat > "$TMP/bin/curl" << 'EOSTUB'
+#!/usr/bin/env bash
+url=""
+for arg in "$@"; do
+  if [[ "$arg" =~ ^http ]]; then
+    url="$arg"
+    break
+  fi
+done
+if [[ -n "$url" ]]; then
+  echo "$url" >> "$TMP/curl.log"
+  path="${url#http://*/}"
+  path="/${path}"
+  code="000"
+  if [[ -f "$TMP/codes" ]]; then
+    found="$(awk -v p="$path" '$1 == p {print $2}' "$TMP/codes")"
+    if [[ -n "$found" ]]; then
+      code="$found"
+    fi
+  fi
+  echo "$code"
+fi
+EOSTUB
+chmod +x "$TMP/bin/curl"
+
+# Stub: sleep is a no-op (so polling rounds are bounded by count, not time)
+cat > "$TMP/bin/sleep" << 'EOSTUB'
+#!/usr/bin/env bash
+# no-op
+EOSTUB
+chmod +x "$TMP/bin/sleep"
+
+# run_smoke VAR=value ... -> runs the smoke script with defaults
+run_smoke() {
+  : > "$TMP/docker.log"
+  : > "$TMP/curl.log"
+  mkdir -p "$TMP/rt"
+  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS=6 SMOKE_POLL_SECONDS=2 PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
+  rc=$?
+}
+
+check() {
+  local name="$1"; shift
+  if "$@"; then
+    echo "PASS $name"
+    pass=$((pass + 1))
+  else
+    echo "FAIL $name"
+    sed 's/^/    | /' "$ERR"
+    fail=$((fail + 1))
+  fi
+}
+
+docker_log_has() { grep -qF -- "$1" "$TMP/docker.log"; }
+curl_log_has() { grep -qF -- "$1" "$TMP/curl.log"; }
+output_has() { grep -qF -- "$1" "$ERR"; }
+output_lacks() { ! grep -qF -- "$1" "$ERR"; }
+
+# port from ExposedPorts
+t() {
+  FAKE_EXPOSED='{"80/tcp":{}}' run_smoke
+  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80" && curl_log_has "http://127.0.0.1:80/api/health/ready"
+}
+setup_codes() {
+  cat > "$TMP/codes" << EOF
+/api/health/ready 200
+EOF
+}
+setup_states() { echo "running" > "$TMP/states"; }
+setup_codes; setup_states
+check "port from ExposedPorts" t
+
+# lowest of several ports
+t() {
+  FAKE_EXPOSED='{"443/tcp":{},"80/tcp":{}}' run_smoke
+  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80"
+}
+setup_codes; setup_states
+check "lowest of several ports" t
+
+# udp-only falls back to 8080
+t() {
+  FAKE_EXPOSED='{"53/udp":{}}' run_smoke
+  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:8080:8080"
+}
+setup_codes; setup_states
+check "udp-only falls back to 8080" t
+
+# no ExposedPorts falls back to 8080
+t() {
+  FAKE_EXPOSED='null' run_smoke
+  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:8080:8080"
+}
+setup_codes; setup_states
+check "no ExposedPorts falls back to 8080" t
+
+# network namespace
+t() {
+  run_smoke
+  docker_log_has "--network container:smoke-postgres" && ! docker_log_has "--network host"
+}
+setup_codes; setup_states
+check "network namespace" t
+
+# default env then caller env
+t() {
+  SMOKE_ENV=$'Database__Provider=Sqlite\nFoo__Bar=1' run_smoke
+  [[ "$rc" = 0 ]] &&
+  env_file="$(cat "$TMP/rt/smoke-test.env")" &&
+  [[ "$(echo "$env_file" | head -n1)" == "Database__Provider=PostgreSQL" ]] &&
+  [[ "$(echo "$env_file" | sed -n '2p')" =~ ^ConnectionStrings__PostgreSQL= ]] &&
+  [[ "$(echo "$env_file" | sed -n '3p')" =~ ^Database__ConnectionString= ]] &&
+  [[ "$(echo "$env_file" | sed -n '4p')" == "Oidc__RequireHttpsMetadata=false" ]] &&
+  [[ "$(echo "$env_file" | sed -n '5p')" == "GameEngine__ClientId=smoketest" ]] &&
+  [[ "$(echo "$env_file" | sed -n '6p')" == "GameEngine__ClientSecret=smoketest" ]] &&
+  [[ "$(echo "$env_file" | sed -n '7p')" == "Database__Provider=Sqlite" ]] &&
+  [[ "$(echo "$env_file" | sed -n '8p')" == "Foo__Bar=1" ]]
+}
+setup_codes; setup_states
+check "default env then caller env" t
+
+# CRLF and blank lines in env
+t() {
+  SMOKE_ENV=$'A=1\r\n\r\nB=2\r\n' run_smoke
+  [[ "$rc" = 0 ]] &&
+  env_file="$(cat "$TMP/rt/smoke-test.env")" &&
+  echo "$env_file" | grep -qF "A=1" &&
+  echo "$env_file" | grep -qF "B=2" &&
+  ! echo "$env_file" | grep -q $'\r'
+}
+setup_codes; setup_states
+check "CRLF and blank lines in env" t
+
+# invalid env line not echoed
+t() {
+  SMOKE_ENV=$'A=1\nexport SECRETVALUE=x' run_smoke
+  [[ "$rc" != 0 ]] && output_has "line 2" && output_lacks "SECRETVALUE" && ! docker_log_has "run "
+}
+check "invalid env line not echoed" t
+
+# explicit path
+t() {
+  SMOKE_PATH=/api/x run_smoke
+  [[ "$rc" = 0 ]] && curl_log_has "http://127.0.0.1:8080/api/x" &&
+  ! curl_log_has "/api/health/ready"
+}
+cat > "$TMP/codes" << EOF
+/api/x 200
+EOF
+setup_states
+check "explicit path" t
+
+# path without leading slash rejected
+t() {
+  SMOKE_PATH=api/x run_smoke
+  [[ "$rc" != 0 ]] && ! docker_log_has "run "
+}
+check "path without leading slash rejected" t
+
+# default list fallback
+t() {
+  run_smoke
+  [[ "$rc" = 0 ]] &&
+  curl_log_has "/api/health/ready" &&
+  curl_log_has "/api/health/version" &&
+  curl_log_has "/api/status"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 000
+/api/health/version 000
+/api/status 200
+EOF
+setup_states
+check "default list fallback" t
+
+# 503 keeps polling
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "503"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 503
+EOF
+setup_states
+check "503 keeps polling" t
+
+# exited container fails fast
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "135" && output_has "APP-LOG-MARKER" &&
+  curl_count="$(wc -l < "$TMP/curl.log" || echo 0)" &&
+  [[ "$curl_count" -le 4 ]]
+}
+echo "exited 135" > "$TMP/states"
+: > "$TMP/codes"
+check "exited container fails fast" t
+
+# docker run fails
+t() {
+  FAKE_RUN_RC=125 FAKE_RUN_ERR='exec format error' run_smoke
+  [[ "$rc" != 0 ]] && output_has "exec format error" && docker_log_has "rm -f"
+}
+check "docker run fails" t
+
+# postgres never ready
+t() {
+  FAKE_PG_RC=1 run_smoke
+  [[ "$rc" != 0 ]] && output_has "Postgres" && ! docker_log_has "--name smoke-app" && docker_log_has "rm -f"
+}
+check "postgres never ready" t
+
+# cleanup on success
+t() {
+  run_smoke
+  [[ "$rc" = 0 ]] && docker_log_has "rm -f" && docker_log_has "smoke-app" && docker_log_has "smoke-postgres"
+}
+setup_codes; setup_states
+check "cleanup on success" t
+
+# logs on timeout
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "APP-LOG-MARKER" && output_has "::group::"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 503
+EOF
+setup_states
+check "logs on timeout" t
+
+# GitHub annotation
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::"
+}
+echo "exited 135" > "$TMP/states"
+: > "$TMP/codes"
+check "GitHub annotation" t
+
+echo "docker-build-smoke: $pass passed, $fail failed"
+[ "$fail" = 0 ]

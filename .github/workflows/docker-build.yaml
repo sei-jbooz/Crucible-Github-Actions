@@ -58,6 +58,21 @@ on:
         description: "Optional shell commands to run before docker build (e.g. fetch artifacts). Runs as caller-supplied shell with the calling workflow's trust."
         type: string
         required: false
+      smokeTest:
+        description: "Run a startup smoke test after building the default stage"
+        type: boolean
+        required: false
+        default: true
+      smokeTestPath:
+        description: "Health endpoint path to check (must start with /). Empty means try the default list."
+        type: string
+        required: false
+        default: ""
+      smokeTestEnv:
+        description: "Additional environment variables for the smoke test (newline-separated KEY=VALUE, applied after defaults)"
+        type: string
+        required: false
+        default: ""
 
     secrets:
       DOCKERHUB_USERNAME:
@@ -299,6 +314,160 @@ jobs:
         with:
           images: ${{ inputs.imageName }}
           tags: |
+
+      - name: Smoke test default stage
+        id: smoke_test
+        if: inputs.smokeTest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Validate SMOKE_PATH
+          if [[ -n "$SMOKE_PATH" ]] && [[ ! "$SMOKE_PATH" =~ ^/ ]]; then
+            echo "::error title=Smoke test failed::SMOKE_PATH must start with /"
+            exit 1
+          fi
+
+          # Validate SMOKE_ENV
+          if [[ -n "$SMOKE_ENV" ]]; then
+            line_num=0
+            while IFS= read -r line; do
+              line_num=$((line_num + 1))
+              # Strip CR and skip blank lines
+              line="${line%$'\r'}"
+              [[ -z "$line" ]] && continue
+              if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_.]*= ]]; then
+                echo "::error title=Smoke test failed::Invalid env line $line_num"
+                exit 1
+              fi
+            done <<< "$SMOKE_ENV"
+          fi
+
+          # Cleanup on exit
+          cleanup() {
+            docker rm -f smoke-app smoke-postgres 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # Detect port from ExposedPorts
+          exposed="$(docker image inspect -f '{{json .Config.ExposedPorts}}' "$IMAGE")"
+          port=8080
+          if [[ "$exposed" != "null" ]]; then
+            tcp_ports="$(echo "$exposed" | jq -r 'keys[] | select(endswith("/tcp"))' | sed 's|/tcp||' || true)"
+            if [[ -n "$tcp_ports" ]]; then
+              port="$(echo "$tcp_ports" | sort -n | head -n1)"
+            fi
+          fi
+
+          # Start Postgres
+          docker run -d --name smoke-postgres \
+            -p "127.0.0.1:${port}:${port}" \
+            -e POSTGRES_PASSWORD=smoketest \
+            -e POSTGRES_DB=smoketest \
+            "$PG_IMAGE"
+
+          # Wait for Postgres to be ready
+          pg_ready=false
+          for i in {1..60}; do
+            if docker exec smoke-postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              pg_ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$pg_ready" != "true" ]]; then
+            echo "::error title=Smoke test failed::Postgres failed to become ready"
+            exit 1
+          fi
+
+          # Write env file with defaults then caller env
+          env_file="$RUNNER_TEMP/smoke-test.env"
+          {
+            echo "Database__Provider=PostgreSQL"
+            echo "ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=smoketest;Username=postgres;Password=smoketest"
+            echo "Database__ConnectionString=Server=localhost;Port=5432;Database=smoketest;Username=postgres;Password=smoketest"
+            echo "Oidc__RequireHttpsMetadata=false"
+            echo "GameEngine__ClientId=smoketest"
+            echo "GameEngine__ClientSecret=smoketest"
+          } > "$env_file"
+
+          # Append caller env (strip CR, skip blank lines)
+          if [[ -n "$SMOKE_ENV" ]]; then
+            while IFS= read -r line; do
+              line="${line%$'\r'}"
+              [[ -z "$line" ]] && continue
+              echo "$line" >> "$env_file"
+            done <<< "$SMOKE_ENV"
+          fi
+
+          # Start the app
+          if ! docker run -d --name smoke-app \
+            --network "container:smoke-postgres" \
+            --env-file "$env_file" \
+            "$IMAGE" 2>&1; then
+            echo "::error title=Smoke test failed::Failed to start container"
+            exit 1
+          fi
+
+          # Determine paths to check
+          if [[ -n "$SMOKE_PATH" ]]; then
+            paths=("$SMOKE_PATH")
+          else
+            paths=("/api/health/ready" "/api/health/version" "/api/status" "/")
+          fi
+
+          # Poll for health
+          max_rounds=$((SMOKE_TIMEOUT_SECONDS / SMOKE_POLL_SECONDS))
+          healthy=false
+          seen_codes=""
+
+          for ((round=1; round<=max_rounds; round++)); do
+            # Check if container is still running
+            state="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' smoke-app 2>/dev/null || echo "unknown")"
+            if [[ "$state" =~ ^exited\ ([0-9]+) ]]; then
+              exit_code="${BASH_REMATCH[1]}"
+              echo "::group::Container logs"
+              docker logs --tail 200 smoke-app
+              echo "::endgroup::"
+              echo "::error title=Smoke test failed::Container exited with code $exit_code"
+              exit 1
+            fi
+
+            # Try each path
+            for path in "${paths[@]}"; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}${path}" 2>/dev/null || echo "000")"
+              if [[ "$code" == "200" ]]; then
+                healthy=true
+                break 2
+              elif [[ "$code" != "000" ]] && [[ ! "$seen_codes" =~ $code ]]; then
+                seen_codes="${seen_codes:+$seen_codes, }$code"
+              fi
+            done
+
+            sleep "$SMOKE_POLL_SECONDS"
+          done
+
+          if [[ "$healthy" != "true" ]]; then
+            echo "::group::Container logs"
+            docker logs --tail 200 smoke-app
+            echo "::endgroup::"
+            if [[ -n "$seen_codes" ]]; then
+              echo "::error title=Smoke test failed::Timeout waiting for healthy response (saw: $seen_codes)"
+            else
+              echo "::error title=Smoke test failed::Timeout waiting for healthy response (no response)"
+            fi
+            exit 1
+          fi
+
+          echo "Smoke test passed"
+        env:
+          IMAGE: smoke-test:local
+          SMOKE_PATH: ${{ inputs.smokeTestPath }}
+          SMOKE_ENV: ${{ inputs.smokeTestEnv }}
+          SMOKE_TIMEOUT_SECONDS: '120'
+          SMOKE_POLL_SECONDS: '2'
+          PG_IMAGE: postgres:17.6
 
       # Push-by-digest: upload the image content but do not apply any
       # tags yet. The merge job collects digests from every platform
