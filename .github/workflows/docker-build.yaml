@@ -377,6 +377,15 @@ jobs:
             fi
           fi
 
+          # Determine paths to check
+          if [[ -n "$SMOKE_PATH" ]]; then
+            paths=("$SMOKE_PATH")
+          else
+            paths=("/api/health/ready" "/api/health/version" "/api/status" "/")
+          fi
+
+          echo "Smoke test: image $IMAGE, port $port, paths ${paths[*]}"
+
           # Start Postgres
           docker run -d --name smoke-postgres \
             -p "127.0.0.1:${port}:${port}" \
@@ -434,13 +443,6 @@ jobs:
             exit 1
           fi
 
-          # Determine paths to check
-          if [[ -n "$SMOKE_PATH" ]]; then
-            paths=("$SMOKE_PATH")
-          else
-            paths=("/api/health/ready" "/api/health/version" "/api/status" "/")
-          fi
-
           # Poll for health
           max_rounds=$((SMOKE_TIMEOUT_SECONDS / SMOKE_POLL_SECONDS))
           healthy=false
@@ -466,6 +468,7 @@ jobs:
               code="${code:-000}"
               if [[ "$code" == "200" ]]; then
                 healthy=true
+                success_path="$path"
                 break 2
               elif [[ "$code" != "000" ]] && [[ ! "$seen_codes" =~ $code ]]; then
                 seen_codes="${seen_codes:+$seen_codes, }$code"
@@ -492,7 +495,7 @@ jobs:
             exit 1
           fi
 
-          echo "Smoke test passed"
+          echo "Smoke test passed: $success_path returned 200 on port $port"
         env:
           IMAGE: smoke-test:local
           SMOKE_PATH: ${{ inputs.smokeTestPath }}

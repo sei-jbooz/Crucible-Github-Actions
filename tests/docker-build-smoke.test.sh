@@ -146,7 +146,7 @@ output_lacks() { ! grep -qF -- "$1" "$ERR"; }
 # port from ExposedPorts
 t() {
   FAKE_EXPOSED='{"80/tcp":{}}' run_smoke
-  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80" && curl_log_has "http://127.0.0.1:80/api/health/ready"
+  [[ "$rc" = 0 ]] && docker_log_has "-p 127.0.0.1:80:80" && curl_log_has "http://127.0.0.1:80/api/health/ready" && output_has "port 80"
 }
 setup_codes() {
   cat > "$TMP/codes" << EOF
@@ -255,7 +255,8 @@ t() {
   ready_line="$(grep -n "/api/health/ready" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
   version_line="$(grep -n "/api/health/version" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
   status_line="$(grep -n "/api/status" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
-  [[ "$ready_line" -lt "$status_line" ]] && [[ "$version_line" -lt "$status_line" ]]
+  [[ "$ready_line" -lt "$status_line" ]] && [[ "$version_line" -lt "$status_line" ]] &&
+  output_has "Smoke test passed: /api/status returned 200 on port"
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 000
