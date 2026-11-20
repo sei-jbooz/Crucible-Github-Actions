@@ -315,6 +315,23 @@ jobs:
           images: ${{ inputs.imageName }}
           tags: |
 
+      - name: Build default stage for smoke test
+        id: build_smoke
+        if: inputs.smokeTest
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ inputs.dockerfilePath }}
+          platforms: ${{ matrix.platform }}
+          pull: true
+          load: true
+          push: false
+          tags: smoke-test:local
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.combined_build_args.outputs.args }}
+          cache-from: type=gha,scope=${{ needs.prepare.outputs.image_slug }}-${{ matrix.safe }}-default
+          cache-to: type=gha,mode=max,scope=${{ needs.prepare.outputs.image_slug }}-${{ matrix.safe }}-default
+
       - name: Smoke test default stage
         id: smoke_test
         if: inputs.smokeTest
@@ -503,7 +520,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ needs.prepare.outputs.image_slug }}-${{ matrix.safe }}-default
 
       - name: Build (no push) default stage
-        if: needs.prepare.outputs.push != 'true'
+        if: needs.prepare.outputs.push != 'true' && !inputs.smokeTest
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .

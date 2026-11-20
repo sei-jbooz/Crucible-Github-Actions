@@ -334,5 +334,115 @@ echo "exited 135" > "$TMP/states"
 : > "$TMP/codes"
 check "GitHub annotation" t
 
+# ============ Structural checks for Task 2: wiring into build flow ============
+
+# Parse step blocks from the workflow (steps at 6 spaces, keys at 8, content at 10+).
+# For each step, extract: name, id (if any), if (if any), and uses/run marker.
+
+# Extract step name by pattern (returns first match or empty)
+step_name_line() {
+  awk -v pat="$1" '
+    /^      - name: / && $0 ~ pat { print; exit }
+  ' "$WORKFLOW"
+}
+
+# Extract step field value (name $1, field $2 like "id:" or "if:")
+step_field() {
+  awk -v step="$1" -v field="$2" '
+    /^      - / { in_step = 0 }
+    $0 ~ "^      - name: " step "$" { in_step = 1; next }
+    in_step && $0 ~ "^        " field " " {
+      line = $0
+      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
+      print line
+      exit
+    }
+  ' "$WORKFLOW"
+}
+
+# Check that a uses: step has a specific attribute in its with: block
+step_with_has() {
+  local step_name="$1" attr="$2" expected="$3"
+  awk -v step="$step_name" -v attr="$attr" -v expected="$expected" '
+    /^      - / { in_step = 0; in_with = 0 }
+    $0 ~ "^      - name: " step "$" { in_step = 1; next }
+    in_step && /^        with:$/ { in_with = 1; next }
+    in_with && $0 ~ "^          " attr ": " {
+      sub(/^[[:space:]]*[^[:space:]]+:[[:space:]]*/, "")
+      if ($0 == expected) exit 0
+      else exit 1
+    }
+    in_with && /^        [^[:space:]]/ { exit 1 }
+  ' "$WORKFLOW"
+}
+
+# build_smoke exists with correct attributes
+t() {
+  [[ -n "$(step_name_line 'Build default stage for smoke test')" ]] &&
+  [[ "$(step_field 'Build default stage for smoke test' 'id:')" == "build_smoke" ]] &&
+  [[ "$(step_field 'Build default stage for smoke test' 'if:')" == "inputs.smokeTest" ]] &&
+  step_with_has 'Build default stage for smoke test' 'load' 'true' &&
+  step_with_has 'Build default stage for smoke test' 'push' 'false' &&
+  step_with_has 'Build default stage for smoke test' 'tags' 'smoke-test:local' &&
+  # No target: means additionalTarget is not used for smoke test
+  ! awk '/^      - name: Build default stage for smoke test$/,/^      - / {if(/^          target:/) exit 0} END{exit 1}' "$WORKFLOW" &&
+  # cache-from scope matches default stage pattern
+  step_with_has 'Build default stage for smoke test' 'cache-from' "type=gha,scope=\${{ needs.prepare.outputs.image_slug }}-\${{ matrix.safe }}-default"
+}
+check "build_smoke exists with correct attributes" t
+
+# smoke_test has if: inputs.smokeTest
+t() {
+  [[ "$(step_field 'Smoke test default stage' 'if:')" == "inputs.smokeTest" ]]
+}
+check "smoke_test has if: inputs.smokeTest" t
+
+# Step order: build_smoke < smoke_test < build_default_push
+t() {
+  build_smoke_line="$(grep -n '^      - name: Build default stage for smoke test$' "$WORKFLOW" | cut -d: -f1)"
+  smoke_test_line="$(grep -n '^      - name: Smoke test default stage$' "$WORKFLOW" | cut -d: -f1)"
+  build_push_line="$(grep -n '^      - name: Build (push by digest) default stage$' "$WORKFLOW" | cut -d: -f1)"
+  [[ -n "$build_smoke_line" ]] && [[ -n "$smoke_test_line" ]] && [[ -n "$build_push_line" ]] &&
+  [[ "$build_smoke_line" -lt "$smoke_test_line" ]] &&
+  [[ "$smoke_test_line" -lt "$build_push_line" ]]
+}
+check "step order: build_smoke < smoke_test < build_default_push" t
+
+# Build (no push) default stage has updated if:
+t() {
+  if_cond="$(step_field 'Build \(no push\) default stage' 'if:')"
+  [[ "$if_cond" == "needs.prepare.outputs.push != 'true' && !inputs.smokeTest" ]]
+}
+check "Build (no push) default stage has updated if condition" t
+
+# No other step if: changed (baseline from origin/main)
+# Expected if: lines (step name | if: condition) from origin/main, excluding the ones we change
+expected_ifs=(
+  "Pre-build commands|inputs.preBuildCommands != ''"
+  "Inject version into package.json files \\(npm\\)|inputs.versionMode == 'npm' && steps.version.outputs.version != '' && inputs.versionFiles != ''"
+  "Prepare build args for .NET version \\(csproj\\)|inputs.versionMode == 'csproj' && steps.version.outputs.version != ''"
+  "Login to Docker Hub|needs.prepare.outputs.push == 'true'"
+  "Build \\(push by digest\\) default stage|needs.prepare.outputs.push == 'true'"
+  "Export default digest|needs.prepare.outputs.push == 'true'"
+  "Upload default digest|needs.prepare.outputs.push == 'true'"
+  "Build \\(push by digest\\) additional target|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+  "Build \\(no push\\) additional target|needs.prepare.outputs.push != 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+  "Export additional digest|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+  "Upload additional digest|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+)
+t() {
+  for entry in "${expected_ifs[@]}"; do
+    step_name="${entry%%|*}"
+    expected_if="${entry#*|}"
+    actual_if="$(step_field "$step_name" 'if:')"
+    if [[ "$actual_if" != "$expected_if" ]]; then
+      echo "Step '$step_name' if: changed: expected '$expected_if', got '$actual_if'" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+check "no other step if: changed from origin/main" t
+
 echo "docker-build-smoke: $pass passed, $fail failed"
 [ "$fail" = 0 ]
