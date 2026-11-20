@@ -68,7 +68,7 @@ elif [[ "$1" == "inspect" && "$*" == *"smoke-app"* ]]; then
     fi
     echo "$state"
   else
-    echo "running"
+    echo "running 0"
   fi
 elif [[ "$1" == "logs" ]]; then
   echo "APP-LOG-MARKER"
@@ -81,6 +81,7 @@ chmod +x "$TMP/bin/docker"
 
 # Stub: curl finds the URL argument, looks up its path in $TMP/codes (lines
 # "PATH CODE"), prints the code (default 000); appends URL to $TMP/curl.log.
+# Exits 7 when printing 000 (to test curl failure handling).
 cat > "$TMP/bin/curl" << 'EOSTUB'
 #!/usr/bin/env bash
 url=""
@@ -102,6 +103,9 @@ if [[ -n "$url" ]]; then
     fi
   fi
   echo "$code"
+  if [[ "$code" == "000" ]]; then
+    exit 7
+  fi
 fi
 EOSTUB
 chmod +x "$TMP/bin/curl"
@@ -149,7 +153,7 @@ setup_codes() {
 /api/health/ready 200
 EOF
 }
-setup_states() { echo "running" > "$TMP/states"; }
+setup_states() { echo "running 0" > "$TMP/states"; }
 setup_codes; setup_states
 check "port from ExposedPorts" t
 
@@ -246,7 +250,12 @@ t() {
   [[ "$rc" = 0 ]] &&
   curl_log_has "/api/health/ready" &&
   curl_log_has "/api/health/version" &&
-  curl_log_has "/api/status"
+  curl_log_has "/api/status" &&
+  # Check order: ready and version before status
+  ready_line="$(grep -n "/api/health/ready" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
+  version_line="$(grep -n "/api/health/version" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
+  status_line="$(grep -n "/api/status" "$TMP/curl.log" | head -1 | cut -d: -f1)" &&
+  [[ "$ready_line" -lt "$status_line" ]] && [[ "$version_line" -lt "$status_line" ]]
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 000
@@ -259,7 +268,9 @@ check "default list fallback" t
 # 503 keeps polling
 t() {
   run_smoke
-  [[ "$rc" != 0 ]] && output_has "503"
+  curl_rounds="$(wc -l < "$TMP/curl.log")"
+  # At 6s timeout, 2s poll: 3 rounds * 4 paths = 12 attempts minimum
+  [[ "$rc" != 0 ]] && output_has "503" && output_has "Timeout" && [[ "$curl_rounds" -ge 12 ]]
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 503
@@ -281,7 +292,10 @@ check "exited container fails fast" t
 # docker run fails
 t() {
   FAKE_RUN_RC=125 FAKE_RUN_ERR='exec format error' run_smoke
-  [[ "$rc" != 0 ]] && output_has "exec format error" && docker_log_has "rm -f"
+  [[ "$rc" != 0 ]] && output_has "exec format error" &&
+  tail -1 "$TMP/docker.log" | grep -qF "rm -f" &&
+  tail -1 "$TMP/docker.log" | grep -qF "smoke-app" &&
+  tail -1 "$TMP/docker.log" | grep -qF "smoke-postgres"
 }
 check "docker run fails" t
 
