@@ -369,9 +369,12 @@ jobs:
             line_num=0
             while IFS= read -r line; do
               line_num=$((line_num + 1))
+              # Like docker --env-file: strip CR and leading whitespace, then
+              # skip blank and comment lines
               line="${line%$'\r'}"
+              line="${line#"${line%%[![:space:]]*}"}"
               [[ -z "$line" ]] && continue
-              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              [[ "$line" == \#* ]] && continue
               if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_.]*= ]]; then
                 echo "::error title=Startup test failed::Invalid env line $line_num"
                 exit 1
@@ -457,8 +460,9 @@ jobs:
           fi
 
           # Poll for health. With the default list, the first path that
-          # answers anything other than 404 or 000 is locked: later rounds
-          # poll only that path, and success needs a 200 from it.
+          # answers 5xx (a health endpoint reporting unhealthy) is locked:
+          # later rounds poll only that path, and success needs a 200 from it.
+          # Any other non-200 answer (404, 401, 3xx, no response) moves on.
           max_rounds=$((STARTUP_TEST_TIMEOUT_SECONDS / STARTUP_TEST_POLL_SECONDS))
           healthy=false
           declare -A last_code
@@ -504,7 +508,7 @@ jobs:
                 success_path="$path"
                 break 2
               fi
-              if [[ -z "$STARTUP_TEST_PATH" && -z "$locked_path" && "$code" != "404" && "$code" != "000" ]]; then
+              if [[ -z "$STARTUP_TEST_PATH" && -z "$locked_path" && "$code" == 5?? ]]; then
                 locked_path="$path"
                 echo "Startup test: using $path (answered $code)"
                 break

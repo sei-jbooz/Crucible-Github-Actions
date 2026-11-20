@@ -277,6 +277,17 @@ t() {
 setup_codes; setup_states
 check "comment lines in env are skipped" t
 
+# like docker --env-file: whitespace-only lines are skipped and leading
+# whitespace is trimmed from KEY=VALUE lines
+t() {
+  STARTUP_TEST_ENV=$'  A=1\n \t \n\tB=2\r\n' run_startup
+  [[ "$rc" = 0 ]] &&
+  caller_env="$(sed -n '7,$p' "$TMP/rt/startup-test.env")" &&
+  [[ "$caller_env" == $'A=1\nB=2' ]]
+}
+setup_codes; setup_states
+check "indented and whitespace-only env lines handled like docker" t
+
 # line numbers in env errors still count comment and blank lines
 t() {
   STARTUP_TEST_ENV=$'# comment\n\nA=1\n  # comment\nexport SECRETVALUE=x' run_startup
@@ -377,7 +388,7 @@ EOF
 setup_states
 check "ready 503 is not masked by version 200" t
 
-# 404 moves on; the first non-404 answer (500) locks, so a later 200 does not count
+# 404 moves on; the first 5xx answer (500) locks, so a later 200 does not count
 t() {
   run_startup
   [[ "$rc" != 0 ]] && output_has "Startup test: using /api/health/version (answered 500)" &&
@@ -389,7 +400,21 @@ cat > "$TMP/codes" << EOF
 /api/status 200
 EOF
 setup_states
-check "first non-404 answer locks the path" t
+check "first 5xx answer locks the path" t
+
+# only 5xx locks: 401 and 3xx (route protected or redirected) move on to a later 200
+t() {
+  run_startup
+  [[ "$rc" = 0 ]] && output_lacks "Startup test: using" &&
+  output_has "Startup test passed: /api/status returned 200 on port"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 401
+/api/health/version 302
+/api/status 200
+EOF
+setup_states
+check "401 and 3xx do not lock the path" t
 
 # 404 on ready and version falls through to /api/status (Gameboard)
 t() {

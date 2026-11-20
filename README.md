@@ -316,7 +316,7 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 
 The workflow runs a startup test by default (`startupTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout. No request runs past the deadline, and a response that arrives after it does not count.
 
-The app runs with these environment variables (in this order), then `startupTestEnv` (blank lines and lines whose first non-space character is `#` are skipped; error messages give the line number counting every line):
+The app runs with these environment variables (in this order), then `startupTestEnv` (leading whitespace is trimmed and blank and `#` comment lines are skipped, as `docker --env-file` reads them; error messages give the line number counting every line):
 
 - `Database__Provider=PostgreSQL`
 - `ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest`
@@ -325,7 +325,7 @@ The app runs with these environment variables (in this order), then `startupTest
 - `GameEngine__ClientId=startuptest`
 - `GameEngine__ClientSecret=startuptest`
 
-The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `startupTestPath` is set, only that path is checked. Otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` in order: a path that answers 404 or does not answer moves on to the next one, and the first path that answers anything else is used from then on (logged as `Startup test: using <path> (answered <code>)`), so the test passes only when that path returns 200. An app whose `/api/health/ready` returns 503 therefore fails rather than passing on `/api/health/version`.
+The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `startupTestPath` is set, only that path is checked. Otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` in order: a path that answers any other non-200 code (404, 401, a redirect) or does not answer moves on to the next one, and the first path that answers 5xx is used from then on (logged as `Startup test: using <path> (answered <code>)`), so the test passes only when that path returns 200. An app whose `/api/health/ready` returns 503 therefore fails rather than passing on `/api/health/version`.
 
 UIs whose nginx falls back to `index.html` answer 200 on any path, so they pass on `/api/health/ready`.
 
