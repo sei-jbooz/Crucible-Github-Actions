@@ -314,7 +314,7 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 
 #### Startup test
 
-The workflow runs a startup test by default (`startupTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
+The workflow runs a startup test by default (`startupTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout. No request runs past the deadline, and a response that arrives after it does not count.
 
 The app runs with these environment variables (in this order), then `startupTestEnv`:
 
@@ -325,9 +325,9 @@ The app runs with these environment variables (in this order), then `startupTest
 - `GameEngine__ClientId=startuptest`
 - `GameEngine__ClientSecret=startuptest`
 
-The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `startupTestPath` is set, only that path is checked; otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` and succeeds on the first 200.
+The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `startupTestPath` is set, only that path is checked. Otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` in order: a path that answers 404 or does not answer moves on to the next one, and the first path that answers anything else is used from then on (logged as `Startup test: using <path> (answered <code>)`), so the test passes only when that path returns 200. An app whose `/api/health/ready` returns 503 therefore fails rather than passing on `/api/health/version`.
 
-UIs whose nginx falls back to `index.html` answer 200 on any path, so any listed path can satisfy the check.
+UIs whose nginx falls back to `index.html` answer 200 on any path, so they pass on `/api/health/ready`.
 
 On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` images (such as `debug`) are not tested.
 

@@ -454,10 +454,13 @@ jobs:
             exit 1
           fi
 
-          # Poll for health
+          # Poll for health. With the default list, the first path that
+          # answers anything other than 404 or 000 is locked: later rounds
+          # poll only that path, and success needs a 200 from it.
           max_rounds=$((STARTUP_TEST_TIMEOUT_SECONDS / STARTUP_TEST_POLL_SECONDS))
           healthy=false
           declare -A last_code
+          locked_path=""
           deadline=$((SECONDS + STARTUP_TEST_TIMEOUT_SECONDS))
 
           for ((round=1; round<=max_rounds; round++)); do
@@ -473,15 +476,36 @@ jobs:
               exit 1
             fi
 
-            # Try each path
-            for path in "${paths[@]}"; do
-              code="$(curl --globoff -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}${path}" 2>/dev/null || true)"
+            # Try each path (only the locked one once a path is locked)
+            if [[ -n "$locked_path" ]]; then
+              round_paths=("$locked_path")
+            else
+              round_paths=("${paths[@]}")
+            fi
+            for path in "${round_paths[@]}"; do
+              # Never start a request at or past the deadline, and never let
+              # one run past it
+              remaining=$((deadline - SECONDS))
+              if [[ "$remaining" -le 0 ]]; then
+                break 2
+              fi
+              max_time=$((remaining < 5 ? remaining : 5))
+              code="$(curl --globoff -s -o /dev/null -w '%{http_code}' --max-time "$max_time" "http://127.0.0.1:${port}${path}" 2>/dev/null || true)"
               code="${code:-000}"
+              # A response that arrives at or after the deadline does not count
+              if [[ "$SECONDS" -ge "$deadline" ]]; then
+                break 2
+              fi
               last_code["$path"]="$code"
               if [[ "$code" == "200" ]]; then
                 healthy=true
                 success_path="$path"
                 break 2
+              fi
+              if [[ -z "$STARTUP_TEST_PATH" && -z "$locked_path" && "$code" != "404" && "$code" != "000" ]]; then
+                locked_path="$path"
+                echo "Startup test: using $path (answered $code)"
+                break
               fi
             done
 
@@ -498,7 +522,12 @@ jobs:
             docker logs --tail 200 startup-test-app || true
             echo "::endgroup::"
             status_msg=""
-            for path in "${paths[@]}"; do
+            if [[ -n "$locked_path" ]]; then
+              report_paths=("$locked_path")
+            else
+              report_paths=("${paths[@]}")
+            fi
+            for path in "${report_paths[@]}"; do
               code="${last_code[$path]:-000}"
               status_msg="${status_msg:+$status_msg }${path}=${code}"
             done

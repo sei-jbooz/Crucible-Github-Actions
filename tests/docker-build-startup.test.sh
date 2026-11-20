@@ -100,17 +100,35 @@ chmod +x "$TMP/bin/docker"
 # Stub: curl finds the URL argument, looks up its path in $TMP/codes (lines
 # "PATH CODE"), prints the code (default 000); appends URL to $TMP/curl.log.
 # Exits 7 when printing 000 (to test curl failure handling).
-# Records all args to $TMP/curl.args for --globoff detection.
+# Records all args to $TMP/curl.args for --globoff and --max-time detection.
+# When $FAKE_CURL_SLEEP is set, each request really takes that many seconds;
+# like real curl, a request longer than --max-time is cut off at --max-time
+# and prints 000 (exit 28), unless $FAKE_CURL_IGNORE_MAX_TIME is set.
 cat > "$TMP/bin/curl" << 'EOSTUB'
 #!/usr/bin/env bash
 echo "$*" >> "$TMP/curl.args"
 url=""
+max_time=""
+prev=""
 for arg in "$@"; do
+  if [[ "$prev" == "--max-time" ]]; then
+    max_time="$arg"
+  fi
+  prev="$arg"
   if [[ "$arg" =~ ^http ]]; then
     url="$arg"
     break
   fi
 done
+if [[ -n "${FAKE_CURL_SLEEP:-}" ]]; then
+  if [[ -z "${FAKE_CURL_IGNORE_MAX_TIME:-}" && -n "$max_time" ]] &&
+     awk -v s="$FAKE_CURL_SLEEP" -v m="$max_time" 'BEGIN { exit !(s > m) }'; then
+    /bin/sleep "$max_time"
+    echo "000"
+    exit 28
+  fi
+  /bin/sleep "$FAKE_CURL_SLEEP"
+fi
 if [[ -n "$url" ]]; then
   echo "$url" >> "$TMP/curl.log"
   path="${url#http://*/}"
@@ -146,7 +164,7 @@ run_startup() {
   : > "$TMP/curl.log"
   : > "$TMP/curl.args"
   mkdir -p "$TMP/rt"
-  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img STARTUP_TEST_TIMEOUT_SECONDS="${STARTUP_TEST_TIMEOUT_SECONDS:-6}" STARTUP_TEST_POLL_SECONDS="${STARTUP_TEST_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 STARTUP_TEST_PATH="${STARTUP_TEST_PATH:-}" STARTUP_TEST_ENV="${STARTUP_TEST_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" FAKE_INSPECT_RC="${FAKE_INSPECT_RC:-}" FAKE_INSPECT_ERR="${FAKE_INSPECT_ERR:-}" FAKE_PULL_RC="${FAKE_PULL_RC:-}" FAKE_PULL_ERR="${FAKE_PULL_ERR:-}" FAKE_PG_RUN_RC="${FAKE_PG_RUN_RC:-}" FAKE_PG_RUN_ERR="${FAKE_PG_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/startup.sh") > "$ERR" 2>&1
+  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img STARTUP_TEST_TIMEOUT_SECONDS="${STARTUP_TEST_TIMEOUT_SECONDS:-6}" STARTUP_TEST_POLL_SECONDS="${STARTUP_TEST_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 STARTUP_TEST_PATH="${STARTUP_TEST_PATH:-}" STARTUP_TEST_ENV="${STARTUP_TEST_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" FAKE_INSPECT_RC="${FAKE_INSPECT_RC:-}" FAKE_INSPECT_ERR="${FAKE_INSPECT_ERR:-}" FAKE_PULL_RC="${FAKE_PULL_RC:-}" FAKE_PULL_ERR="${FAKE_PULL_ERR:-}" FAKE_PG_RUN_RC="${FAKE_PG_RUN_RC:-}" FAKE_PG_RUN_ERR="${FAKE_PG_RUN_ERR:-}" FAKE_CURL_SLEEP="${FAKE_CURL_SLEEP:-}" FAKE_CURL_IGNORE_MAX_TIME="${FAKE_CURL_IGNORE_MAX_TIME:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/startup.sh") > "$ERR" 2>&1
   rc=$?
 }
 
@@ -309,12 +327,14 @@ EOF
 setup_states
 check "default list fallback" t
 
-# 503 keeps polling
+# 503 locks the path and keeps polling only it: at 6s timeout and 2s poll,
+# 3 rounds of one request each, logged once
 t() {
   run_startup
-  curl_rounds="$(wc -l < "$TMP/curl.log")"
-  # At 6s timeout, 2s poll: 3 rounds * 4 paths = 12 attempts minimum
-  [[ "$rc" != 0 ]] && output_has "last status:" && output_has "/api/health/ready=503" && [[ "$curl_rounds" -ge 12 ]]
+  [[ "$rc" != 0 ]] && output_has "last status: /api/health/ready=503)" &&
+  [[ "$(wc -l < "$TMP/curl.log")" -eq 3 ]] &&
+  [[ "$(grep -c '/api/health/ready$' "$TMP/curl.log")" -eq 3 ]] &&
+  [[ "$(grep -cF 'Startup test: using /api/health/ready (answered 503)' "$ERR")" -eq 1 ]]
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 503
@@ -323,16 +343,96 @@ cat > "$TMP/codes" << EOF
 / 404
 EOF
 setup_states
-check "503 keeps polling" t
+check "503 locks the path and keeps polling it" t
 
-# timeout message with last code per path
+# a locked 503 is not masked by a later path's 200
 t() {
   run_startup
-  [[ "$rc" != 0 ]] && output_has "last status: /api/health/ready=503 /api/health/version=404 /api/status=404 /=404"
+  [[ "$rc" != 0 ]] &&
+  output_has "::error title=Startup test failed::Timeout waiting for healthy response (last status: /api/health/ready=503)" &&
+  output_lacks "Startup test passed" && ! curl_log_has "/api/health/version"
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 503
+/api/health/version 200
+EOF
+setup_states
+check "ready 503 is not masked by version 200" t
+
+# 404 moves on; the first non-404 answer (500) locks, so a later 200 does not count
+t() {
+  run_startup
+  [[ "$rc" != 0 ]] && output_has "Startup test: using /api/health/version (answered 500)" &&
+  output_has "(last status: /api/health/version=500)" && ! curl_log_has "/api/status"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 404
+/api/health/version 500
+/api/status 200
+EOF
+setup_states
+check "first non-404 answer locks the path" t
+
+# 404 on ready and version falls through to /api/status (Gameboard)
+t() {
+  run_startup
+  [[ "$rc" = 0 ]] && output_has "Startup test passed: /api/status returned 200 on port 8080" &&
+  output_lacks "Startup test: using"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 404
 /api/health/version 404
+/api/status 200
+EOF
+setup_states
+check "ready and version 404 pass via /api/status" t
+
+# ready 200 passes on the first request
+t() {
+  run_startup
+  [[ "$rc" = 0 ]] && output_has "Startup test passed: /api/health/ready returned 200 on port 8080" &&
+  [[ "$(wc -l < "$TMP/curl.log")" -eq 1 ]]
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 200
+EOF
+setup_states
+check "ready 200 passes" t
+
+# a UI that answers 200 on every path passes via /api/health/ready
+t() {
+  run_startup
+  [[ "$rc" = 0 ]] && output_has "Startup test passed: /api/health/ready returned 200 on port 8080" &&
+  ! curl_log_has "/api/health/version"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 200
+/api/health/version 200
+/api/status 200
+/ 200
+EOF
+setup_states
+check "all-200 UI passes via /api/health/ready" t
+
+# explicit path: no lock message, timeout names only that path
+t() {
+  STARTUP_TEST_PATH=/api/x run_startup
+  [[ "$rc" != 0 ]] && output_lacks "Startup test: using" && output_has "(last status: /api/x=503)" &&
+  [[ "$(wc -l < "$TMP/curl.log")" -eq 3 ]]
+}
+cat > "$TMP/codes" << EOF
+/api/x 503
+EOF
+setup_states
+check "explicit path with 503 times out without a lock message" t
+
+# timeout message with last code per path (no path locked)
+t() {
+  run_startup
+  [[ "$rc" != 0 ]] && output_has "last status: /api/health/ready=404 /api/health/version=000 /api/status=404 /=404"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 404
 /api/status 404
 / 404
 EOF
@@ -361,6 +461,47 @@ t() {
 : > "$TMP/codes"
 setup_states
 check "deadline stops loop before max rounds" t
+
+# --max-time is 5 while more than 5 seconds remain
+t() {
+  run_startup
+  [[ "$rc" = 0 ]] && head -n1 "$TMP/curl.args" | grep -qF -- '--max-time 5 '
+}
+setup_codes; setup_states
+check "curl --max-time is 5 with time to spare" t
+
+# deadline hit mid-round: with a 3s timeout and 1s requests, the deadline
+# passes before the round reaches the fourth path, and the first request's
+# --max-time is clamped to the 3 seconds remaining
+t() {
+  STARTUP_TEST_TIMEOUT_SECONDS=3 STARTUP_TEST_POLL_SECONDS=1 FAKE_CURL_SLEEP=1 run_startup
+  curl_count="$(wc -l < "$TMP/curl.log")"
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Timeout waiting for healthy response" &&
+  [[ "$curl_count" -ge 1 ]] && [[ "$curl_count" -le 3 ]] &&
+  head -n1 "$TMP/curl.args" | grep -qF -- '--max-time 3 '
+}
+: > "$TMP/codes"
+setup_states
+check "deadline hit mid-round stops polling" t
+
+# a 200 that would only arrive after the deadline: --max-time is clamped to
+# the 2 seconds remaining, so the 3-second request is cut off and fails
+t() {
+  STARTUP_TEST_TIMEOUT_SECONDS=2 STARTUP_TEST_POLL_SECONDS=1 FAKE_CURL_SLEEP=3 run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Timeout waiting for healthy response" &&
+  output_lacks "Startup test passed" && head -n1 "$TMP/curl.args" | grep -qF -- '--max-time 2 '
+}
+setup_codes; setup_states
+check "200 after the deadline is cut off by --max-time" t
+
+# a 200 received after the deadline is not accepted even if curl overruns
+t() {
+  STARTUP_TEST_TIMEOUT_SECONDS=2 STARTUP_TEST_POLL_SECONDS=1 FAKE_CURL_SLEEP=3 FAKE_CURL_IGNORE_MAX_TIME=1 run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Timeout waiting for healthy response" &&
+  output_lacks "Startup test passed" && [[ "$(wc -l < "$TMP/curl.log")" -eq 1 ]]
+}
+setup_codes; setup_states
+check "200 received after the deadline is rejected" t
 
 # exited container fails fast
 t() {
