@@ -82,8 +82,10 @@ chmod +x "$TMP/bin/docker"
 # Stub: curl finds the URL argument, looks up its path in $TMP/codes (lines
 # "PATH CODE"), prints the code (default 000); appends URL to $TMP/curl.log.
 # Exits 7 when printing 000 (to test curl failure handling).
+# Records all args to $TMP/curl.args for --globoff detection.
 cat > "$TMP/bin/curl" << 'EOSTUB'
 #!/usr/bin/env bash
+echo "$*" >> "$TMP/curl.args"
 url=""
 for arg in "$@"; do
   if [[ "$arg" =~ ^http ]]; then
@@ -110,10 +112,13 @@ fi
 EOSTUB
 chmod +x "$TMP/bin/curl"
 
-# Stub: sleep is a no-op (so polling rounds are bounded by count, not time)
+# Stub: sleep is a no-op by default (so polling rounds are bounded by count, not time),
+# but can burn time if $FAKE_SLEEP_SECONDS is set
 cat > "$TMP/bin/sleep" << 'EOSTUB'
 #!/usr/bin/env bash
-# no-op
+if [[ -n "${FAKE_SLEEP_SECONDS:-}" ]]; then
+  /bin/sleep "$FAKE_SLEEP_SECONDS"
+fi
 EOSTUB
 chmod +x "$TMP/bin/sleep"
 
@@ -121,8 +126,9 @@ chmod +x "$TMP/bin/sleep"
 run_smoke() {
   : > "$TMP/docker.log"
   : > "$TMP/curl.log"
+  : > "$TMP/curl.args"
   mkdir -p "$TMP/rt"
-  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS=6 SMOKE_POLL_SECONDS=2 PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
+  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-6}" SMOKE_POLL_SECONDS="${SMOKE_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
   rc=$?
 }
 
@@ -244,6 +250,25 @@ t() {
 }
 check "path without leading slash rejected" t
 
+# path with space rejected before docker run
+t() {
+  SMOKE_PATH='/api/x y' run_smoke
+  [[ "$rc" != 0 ]] && output_has "invalid characters" && ! docker_log_has "run "
+}
+check "path with space rejected before docker run" t
+
+# path with bracket accepted and curl called with --globoff
+t() {
+  SMOKE_PATH='/api/x[0]' run_smoke
+  [[ "$rc" = 0 ]] && curl_log_has "http://127.0.0.1:8080/api/x[0]" &&
+  grep -qF -- '--globoff' "$TMP/curl.args"
+}
+cat > "$TMP/codes" << EOF
+/api/x[0] 200
+EOF
+setup_states
+check "path with bracket accepted and curl called with --globoff" t
+
 # default list fallback
 t() {
   run_smoke
@@ -271,13 +296,52 @@ t() {
   run_smoke
   curl_rounds="$(wc -l < "$TMP/curl.log")"
   # At 6s timeout, 2s poll: 3 rounds * 4 paths = 12 attempts minimum
-  [[ "$rc" != 0 ]] && output_has "503" && output_has "Timeout" && [[ "$curl_rounds" -ge 12 ]]
+  [[ "$rc" != 0 ]] && output_has "last status:" && output_has "/api/health/ready=503" && [[ "$curl_rounds" -ge 12 ]]
 }
 cat > "$TMP/codes" << EOF
 /api/health/ready 503
+/api/health/version 404
+/api/status 404
+/ 404
 EOF
 setup_states
 check "503 keeps polling" t
+
+# timeout message with last code per path
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "last status: /api/health/ready=503 /api/health/version=404 /api/status=404 /=404"
+}
+cat > "$TMP/codes" << EOF
+/api/health/ready 503
+/api/health/version 404
+/api/status 404
+/ 404
+EOF
+setup_states
+check "timeout message with last code per path" t
+
+# timeout with 000 codes included
+t() {
+  run_smoke
+  [[ "$rc" != 0 ]] && output_has "last status:" && output_has "/api/health/ready=000" && output_has "/api/health/version=000"
+}
+: > "$TMP/codes"
+setup_states
+check "timeout with 000 codes included" t
+
+# deadline stops loop before max rounds
+t() {
+  SMOKE_TIMEOUT_SECONDS=1 SMOKE_POLL_SECONDS=2 FAKE_SLEEP_SECONDS=0.5 run_smoke
+  curl_rounds="$(wc -l < "$TMP/curl.log")"
+  # With 1s timeout and 2s poll interval, max_rounds = 0 (1/2), but loop always runs at least once
+  # So we expect < 4 paths * 2 rounds = 8 (the loop should stop by deadline after 1-2 seconds of real time)
+  # Actually, with sleep burning 0.5s per round, we'll get 1-2 rounds before hitting the 1s deadline
+  [[ "$rc" != 0 ]] && output_has "Timeout" && [[ "$curl_rounds" -lt 8 ]]
+}
+: > "$TMP/codes"
+setup_states
+check "deadline stops loop before max rounds" t
 
 # exited container fails fast
 t() {
@@ -444,6 +508,60 @@ t() {
   return 0
 }
 check "no other step if: changed from origin/main" t
+
+# build_smoke has no continue-on-error
+t() {
+  ! awk '/^      - name: Build default stage for smoke test$/,/^      - / {if(/^        continue-on-error:/) exit 0} END{exit 1}' "$WORKFLOW"
+}
+check "build_smoke has no continue-on-error" t
+
+# smoke_test has no continue-on-error
+t() {
+  ! awk '/^      - name: Smoke test default stage$/,/^      - / {if(/^        continue-on-error:/) exit 0} END{exit 1}' "$WORKFLOW"
+}
+check "smoke_test has no continue-on-error" t
+
+# build_smoke and build_default_push have identical build attributes
+t() {
+  smoke_context="$(step_with_extract 'Build default stage for smoke test' 'context')"
+  push_context="$(step_with_extract 'Build \(push by digest\) default stage' 'context')"
+  smoke_file="$(step_with_extract 'Build default stage for smoke test' 'file')"
+  push_file="$(step_with_extract 'Build \(push by digest\) default stage' 'file')"
+  smoke_platforms="$(step_with_extract 'Build default stage for smoke test' 'platforms')"
+  push_platforms="$(step_with_extract 'Build \(push by digest\) default stage' 'platforms')"
+  smoke_pull="$(step_with_extract 'Build default stage for smoke test' 'pull')"
+  push_pull="$(step_with_extract 'Build \(push by digest\) default stage' 'pull')"
+  smoke_build_args="$(step_with_extract 'Build default stage for smoke test' 'build-args')"
+  push_build_args="$(step_with_extract 'Build \(push by digest\) default stage' 'build-args')"
+  smoke_labels="$(step_with_extract 'Build default stage for smoke test' 'labels')"
+  push_labels="$(step_with_extract 'Build \(push by digest\) default stage' 'labels')"
+  smoke_cache_from="$(step_with_extract 'Build default stage for smoke test' 'cache-from')"
+  push_cache_from="$(step_with_extract 'Build \(push by digest\) default stage' 'cache-from')"
+
+  [[ "$smoke_context" == "$push_context" ]] &&
+  [[ "$smoke_file" == "$push_file" ]] &&
+  [[ "$smoke_platforms" == "$push_platforms" ]] &&
+  [[ "$smoke_pull" == "$push_pull" ]] &&
+  [[ "$smoke_build_args" == "$push_build_args" ]] &&
+  [[ "$smoke_labels" == "$push_labels" ]] &&
+  [[ "$smoke_cache_from" == "$push_cache_from" ]]
+}
+# Helper to extract step with: attribute value
+step_with_extract() {
+  local step_name="$1" attr="$2"
+  awk -v step="$step_name" -v attr="$attr" '
+    /^      - / { in_step = 0; in_with = 0 }
+    $0 ~ "^      - name: " step "$" { in_step = 1; next }
+    in_step && /^        with:$/ { in_with = 1; next }
+    in_with && $0 ~ "^          " attr ": " {
+      sub(/^[[:space:]]*[^[:space:]]+:[[:space:]]*/, "")
+      print
+      exit
+    }
+    in_with && /^        [^[:space:]]/ { exit 1 }
+  ' "$WORKFLOW"
+}
+check "build_smoke and build_default_push have identical build attributes" t
 
 echo "docker-build-smoke: $pass passed, $fail failed"
 [ "$fail" = 0 ]

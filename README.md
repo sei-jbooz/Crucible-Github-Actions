@@ -314,7 +314,7 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 
 #### Startup smoke test
 
-The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) in a shared network namespace with the built image, polls the app's health endpoints for up to 120 seconds, and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
+The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`), and the built image joins the Postgres container's network namespace, polls the app's health endpoints for up to 120 seconds, and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
 
 The app runs with these environment variables (in this order), then `smokeTestEnv`:
 
@@ -327,7 +327,11 @@ The app runs with these environment variables (in this order), then `smokeTestEn
 
 The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `smokeTestPath` is set, only that path is checked; otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` and succeeds on the first 200.
 
-On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` and `debug` images are not smoke tested.
+UIs whose nginx falls back to `index.html` answer 200 on any path, so any listed path can satisfy the check.
+
+On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` images (such as `debug`) are not smoke tested.
+
+Opt out by setting `smokeTest: false` when the image exits by design, needs services other than Postgres, listens on a port other than its lowest EXPOSEd TCP port (or 8080 with no EXPOSE), or needs more than 120 seconds to start.
 
 To opt out, set `smokeTest: false`:
 

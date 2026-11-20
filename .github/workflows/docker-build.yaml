@@ -4,12 +4,13 @@
 # Each platform builds on its native GitHub-hosted runner (amd64 on
 # ubuntu-24.04, arm64 on ubuntu-24.04-arm) in parallel.
 #
-# On the push path each build job: builds the default stage with load, runs
-# a startup smoke test against the loaded image (default on, opt-out with
-# smokeTest: false), then pushes by digest only (no tags); the merge job
-# assembles a multi-arch manifest list over those digests and applies the
-# final tag set. No-push path (PRs, explicit push=false): builds and tests
-# run for validation only and merge is skipped entirely.
+# On the push path each build job: builds the default stage with load (when
+# smokeTest is true), runs a startup smoke test against the loaded image
+# (default on, opt-out with smokeTest: false), then pushes by digest only
+# (no tags); the merge job assembles a multi-arch manifest list over those
+# digests and applies the final tag set. No-push path (PRs, explicit
+# push=false): builds and tests run for validation only and merge is skipped
+# entirely.
 
 name: Build & Publish Image
 
@@ -341,9 +342,15 @@ jobs:
           set -euo pipefail
 
           # Validate SMOKE_PATH
-          if [[ -n "$SMOKE_PATH" ]] && [[ ! "$SMOKE_PATH" =~ ^/ ]]; then
-            echo "::error title=Smoke test failed::SMOKE_PATH must start with /"
-            exit 1
+          if [[ -n "$SMOKE_PATH" ]]; then
+            if [[ ! "$SMOKE_PATH" =~ ^/ ]]; then
+              echo "::error title=Smoke test failed::SMOKE_PATH must start with /"
+              exit 1
+            fi
+            if [[ "$SMOKE_PATH" =~ [[:space:]]|[[:cntrl:]] ]]; then
+              echo "::error title=Smoke test failed::SMOKE_PATH contains invalid characters"
+              exit 1
+            fi
           fi
 
           # Validate SMOKE_ENV
@@ -363,12 +370,15 @@ jobs:
 
           # Cleanup on exit
           cleanup() {
-            docker rm -f smoke-app smoke-postgres 2>/dev/null || true
+            docker rm -f smoke-app smoke-postgres >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
           # Detect port from ExposedPorts
-          exposed="$(docker image inspect -f '{{json .Config.ExposedPorts}}' "$IMAGE")"
+          if ! exposed="$(docker image inspect -f '{{json .Config.ExposedPorts}}' "$IMAGE" 2>&1)"; then
+            echo "::error title=Smoke test failed::Failed to inspect image"
+            exit 1
+          fi
           port=8080
           if [[ "$exposed" != "null" ]]; then
             tcp_ports="$(echo "$exposed" | jq -r 'keys[] | select(endswith("/tcp"))' | sed 's|/tcp||' || true)"
@@ -386,12 +396,15 @@ jobs:
 
           echo "Smoke test: image $IMAGE, port $port, paths ${paths[*]}"
 
+          # Pull Postgres image
+          docker pull -q "$PG_IMAGE"
+
           # Start Postgres
           docker run -d --name smoke-postgres \
             -p "127.0.0.1:${port}:${port}" \
             -e POSTGRES_PASSWORD=smoketest \
             -e POSTGRES_DB=smoketest \
-            "$PG_IMAGE"
+            "$PG_IMAGE" >/dev/null
 
           # Wait for Postgres to be ready
           pg_ready=false
@@ -405,7 +418,7 @@ jobs:
 
           if [[ "$pg_ready" != "true" ]]; then
             echo "::group::Container logs"
-            docker logs --tail 200 smoke-postgres
+            docker logs --tail 200 smoke-postgres || true
             echo "::endgroup::"
             echo "::error title=Smoke test failed::Postgres failed to become ready"
             exit 1
@@ -435,7 +448,7 @@ jobs:
           if ! docker run -d --name smoke-app \
             --network "container:smoke-postgres" \
             --env-file "$env_file" \
-            "$IMAGE" 2>&1; then
+            "$IMAGE" >/dev/null; then
             echo "::group::Container logs"
             docker logs --tail 200 smoke-app 2>/dev/null || true
             echo "::endgroup::"
@@ -446,7 +459,7 @@ jobs:
           # Poll for health
           max_rounds=$((SMOKE_TIMEOUT_SECONDS / SMOKE_POLL_SECONDS))
           healthy=false
-          seen_codes=""
+          declare -A last_code
           deadline=$((SECONDS + SMOKE_TIMEOUT_SECONDS))
 
           for ((round=1; round<=max_rounds; round++)); do
@@ -456,7 +469,7 @@ jobs:
             if [[ "$status" != "running" ]]; then
               exit_code="${state##* }"
               echo "::group::Container logs"
-              docker logs --tail 200 smoke-app
+              docker logs --tail 200 smoke-app || true
               echo "::endgroup::"
               echo "::error title=Smoke test failed::Container $status with exit code $exit_code"
               exit 1
@@ -464,14 +477,13 @@ jobs:
 
             # Try each path
             for path in "${paths[@]}"; do
-              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}${path}" 2>/dev/null || true)"
+              code="$(curl --globoff -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}${path}" 2>/dev/null || true)"
               code="${code:-000}"
+              last_code["$path"]="$code"
               if [[ "$code" == "200" ]]; then
                 healthy=true
                 success_path="$path"
                 break 2
-              elif [[ "$code" != "000" ]] && [[ ! "$seen_codes" =~ $code ]]; then
-                seen_codes="${seen_codes:+$seen_codes, }$code"
               fi
             done
 
@@ -485,13 +497,14 @@ jobs:
 
           if [[ "$healthy" != "true" ]]; then
             echo "::group::Container logs"
-            docker logs --tail 200 smoke-app
+            docker logs --tail 200 smoke-app || true
             echo "::endgroup::"
-            if [[ -n "$seen_codes" ]]; then
-              echo "::error title=Smoke test failed::Timeout waiting for healthy response (saw: $seen_codes)"
-            else
-              echo "::error title=Smoke test failed::Timeout waiting for healthy response (no response)"
-            fi
+            status_msg=""
+            for path in "${paths[@]}"; do
+              code="${last_code[$path]:-000}"
+              status_msg="${status_msg:+$status_msg }${path}=${code}"
+            done
+            echo "::error title=Smoke test failed::Timeout waiting for healthy response (last status: $status_msg)"
             exit 1
           fi
 
