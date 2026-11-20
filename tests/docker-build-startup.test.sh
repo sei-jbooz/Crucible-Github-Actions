@@ -267,6 +267,24 @@ t() {
 }
 check "invalid env line not echoed" t
 
+# comment lines in env are skipped like blank lines
+t() {
+  STARTUP_TEST_ENV=$'# leading comment\nA=1\n   # indented comment\r\n\t#tab comment\n#B=commented\nC=2 # kept in value\n' run_startup
+  [[ "$rc" = 0 ]] &&
+  caller_env="$(sed -n '7,$p' "$TMP/rt/startup-test.env")" &&
+  [[ "$caller_env" == $'A=1\nC=2 # kept in value' ]]
+}
+setup_codes; setup_states
+check "comment lines in env are skipped" t
+
+# line numbers in env errors still count comment and blank lines
+t() {
+  STARTUP_TEST_ENV=$'# comment\n\nA=1\n  # comment\nexport SECRETVALUE=x' run_startup
+  [[ "$rc" != 0 ]] && output_has "::error title=Startup test failed::Invalid env line 5" &&
+  output_lacks "SECRETVALUE" && ! docker_log_has "run "
+}
+check "env error line numbers count comment lines" t
+
 # explicit path
 t() {
   STARTUP_TEST_PATH=/api/x run_startup

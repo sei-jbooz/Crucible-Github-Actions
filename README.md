@@ -310,13 +310,13 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 | `preBuildCommands` |  | Optional shell commands to run before the Docker build (e.g., fetch artifacts). |
 | `startupTest` |  | Run a startup test after building the default stage; default `true`. |
 | `startupTestPath` |  | Health endpoint path to check (must start with `/`). Empty means try the default list. |
-| `startupTestEnv` |  | Additional environment variables for the startup test (newline-separated `KEY=VALUE`, applied after defaults). |
+| `startupTestEnv` |  | Additional environment variables for the startup test (newline-separated `KEY=VALUE`, applied after defaults; blank lines and lines starting with `#` are skipped). |
 
 #### Startup test
 
 The workflow runs a startup test by default (`startupTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout. No request runs past the deadline, and a response that arrives after it does not count.
 
-The app runs with these environment variables (in this order), then `startupTestEnv`:
+The app runs with these environment variables (in this order), then `startupTestEnv` (blank lines and lines whose first non-space character is `#` are skipped; error messages give the line number counting every line):
 
 - `Database__Provider=PostgreSQL`
 - `ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest`

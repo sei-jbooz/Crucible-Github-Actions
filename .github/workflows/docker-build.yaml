@@ -71,7 +71,7 @@ on:
         required: false
         default: ""
       startupTestEnv:
-        description: "Additional environment variables for the startup test (newline-separated KEY=VALUE, applied after defaults)"
+        description: "Additional environment variables for the startup test (newline-separated KEY=VALUE, applied after defaults; blank lines and lines starting with # are skipped)"
         type: string
         required: false
         default: ""
@@ -354,7 +354,8 @@ jobs:
           fi
 
           # Write the env file: defaults first, then the validated caller env
-          # (CR stripped, blank lines skipped), so caller values override.
+          # (CR stripped, blank and comment lines skipped), so caller values
+          # override.
           env_file="$RUNNER_TEMP/startup-test.env"
           {
             echo "Database__Provider=PostgreSQL"
@@ -370,6 +371,7 @@ jobs:
               line_num=$((line_num + 1))
               line="${line%$'\r'}"
               [[ -z "$line" ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
               if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_.]*= ]]; then
                 echo "::error title=Startup test failed::Invalid env line $line_num"
                 exit 1
