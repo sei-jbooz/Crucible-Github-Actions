@@ -314,7 +314,7 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 
 #### Startup smoke test
 
-The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`), and the built image joins the Postgres container's network namespace, polls the app's health endpoints for up to 120 seconds, and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
+The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) and runs the built image in the Postgres container's network namespace. It then polls the app's health endpoints for up to 120 seconds and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
 
 The app runs with these environment variables (in this order), then `smokeTestEnv`:
 
@@ -331,9 +331,7 @@ UIs whose nginx falls back to `index.html` answer 200 on any path, so any listed
 
 On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` images (such as `debug`) are not smoke tested.
 
-Opt out by setting `smokeTest: false` when the image exits by design, needs services other than Postgres, listens on a port other than its lowest EXPOSEd TCP port (or 8080 with no EXPOSE), or needs more than 120 seconds to start.
-
-To opt out, set `smokeTest: false`:
+Opt out by setting `smokeTest: false` when the image exits by design, needs services other than Postgres, listens on a port other than its lowest EXPOSEd TCP port (or 8080 with no EXPOSE), or needs more than 120 seconds to start:
 
 ```yaml
 jobs:

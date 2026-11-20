@@ -375,7 +375,9 @@ jobs:
           trap cleanup EXIT
 
           # Detect port from ExposedPorts
-          if ! exposed="$(docker image inspect -f '{{json .Config.ExposedPorts}}' "$IMAGE" 2>&1)"; then
+          inspect_err="$RUNNER_TEMP/smoke-inspect.err"
+          if ! exposed="$(docker image inspect -f '{{json .Config.ExposedPorts}}' "$IMAGE" 2>"$inspect_err")"; then
+            cat "$inspect_err" >&2 || true
             echo "::error title=Smoke test failed::Failed to inspect image"
             exit 1
           fi
@@ -396,15 +398,21 @@ jobs:
 
           echo "Smoke test: image $IMAGE, port $port, paths ${paths[*]}"
 
-          # Pull Postgres image
-          docker pull -q "$PG_IMAGE"
+          # Pull Postgres image (docker's stderr stays visible in the log)
+          if ! docker pull -q "$PG_IMAGE"; then
+            echo "::error title=Smoke test failed::Failed to pull Postgres image"
+            exit 1
+          fi
 
           # Start Postgres
-          docker run -d --name smoke-postgres \
+          if ! docker run -d --name smoke-postgres \
             -p "127.0.0.1:${port}:${port}" \
             -e POSTGRES_PASSWORD=smoketest \
             -e POSTGRES_DB=smoketest \
-            "$PG_IMAGE" >/dev/null
+            "$PG_IMAGE" >/dev/null; then
+            echo "::error title=Smoke test failed::Failed to start Postgres container"
+            exit 1
+          fi
 
           # Wait for Postgres to be ready
           pg_ready=false

@@ -16,7 +16,7 @@ trap 'rm -rf "$TMP"' EXIT
 extract_step() {
   awk -v want="$2" '
     /^      - / { in_step = 0 }
-    $0 ~ "^        id: " want "$" { in_step = 1; next }
+    $0 == "        id: " want { in_step = 1; next }
     in_step && /^        run: \|$/ { in_run = 1; next }
     in_run {
       if ($0 ~ /^      - / || ($0 !~ /^[[:space:]]*$/ && $0 !~ /^          /)) { exit }
@@ -36,15 +36,29 @@ ERR="$TMP/err"
 # Create stub directory
 mkdir -p "$TMP/bin"
 
-# Stub: docker logs all invocations; inspect -f '{{json .Config.ExposedPorts}}'
-# returns $FAKE_EXPOSED; exec ... pg_isready exits $FAKE_PG_RC; run ... smoke-app
-# exits $FAKE_RUN_RC (prints $FAKE_RUN_ERR to stderr when non-zero); inspect -f
-# on smoke-app pops a line from $TMP/states (repeats last); logs prints marker; rm succeeds.
+# Stub: docker logs all invocations; image inspect returns $FAKE_EXPOSED (or
+# prints $FAKE_INSPECT_ERR to stderr and exits $FAKE_INSPECT_RC when non-zero);
+# pull exits $FAKE_PULL_RC (prints $FAKE_PULL_ERR); exec ... pg_isready exits
+# $FAKE_PG_RC; run ... smoke-app exits $FAKE_RUN_RC (prints $FAKE_RUN_ERR to
+# stderr when non-zero); the Postgres run exits $FAKE_PG_RUN_RC (prints
+# $FAKE_PG_RUN_ERR); inspect -f on smoke-app pops a line from $TMP/states
+# (repeats last); logs prints marker; rm succeeds.
 cat > "$TMP/bin/docker" << 'EOSTUB'
 #!/usr/bin/env bash
 echo "$*" >> "$TMP/docker.log"
 if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  rc="${FAKE_INSPECT_RC:-0}"
+  if [[ "$rc" != 0 ]]; then
+    echo "${FAKE_INSPECT_ERR:-}" >&2
+    exit "$rc"
+  fi
   echo "${FAKE_EXPOSED:-null}"
+elif [[ "$1" == "pull" ]]; then
+  rc="${FAKE_PULL_RC:-0}"
+  if [[ "$rc" != 0 ]]; then
+    echo "${FAKE_PULL_ERR:-}" >&2
+  fi
+  exit "$rc"
 elif [[ "$1" == "exec" && "$2" == "smoke-postgres" && "$3" == "pg_isready" ]]; then
   exit "${FAKE_PG_RC:-0}"
 elif [[ "$1" == "run" && "$*" == *"smoke-app"* ]]; then
@@ -54,8 +68,12 @@ elif [[ "$1" == "run" && "$*" == *"smoke-app"* ]]; then
   fi
   exit "$rc"
 elif [[ "$1" == "run" ]]; then
-  # Postgres or other container - just succeed
-  exit 0
+  # Postgres container
+  rc="${FAKE_PG_RUN_RC:-0}"
+  if [[ "$rc" != 0 ]]; then
+    echo "${FAKE_PG_RUN_ERR:-}" >&2
+  fi
+  exit "$rc"
 elif [[ "$1" == "inspect" && "$*" == *"smoke-app"* ]]; then
   if [[ -f "$TMP/states" && -s "$TMP/states" ]]; then
     state="$(head -n1 "$TMP/states")"
@@ -128,7 +146,7 @@ run_smoke() {
   : > "$TMP/curl.log"
   : > "$TMP/curl.args"
   mkdir -p "$TMP/rt"
-  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-6}" SMOKE_POLL_SECONDS="${SMOKE_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
+  (cd "$TMP" && env -i PATH="$TMP/bin:$PATH" RUNNER_TEMP="$TMP/rt" IMAGE=img SMOKE_TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-6}" SMOKE_POLL_SECONDS="${SMOKE_POLL_SECONDS:-2}" PG_IMAGE=postgres:17.6 SMOKE_PATH="${SMOKE_PATH:-}" SMOKE_ENV="${SMOKE_ENV:-}" TMP="$TMP" FAKE_EXPOSED="${FAKE_EXPOSED:-}" FAKE_PG_RC="${FAKE_PG_RC:-}" FAKE_RUN_RC="${FAKE_RUN_RC:-}" FAKE_RUN_ERR="${FAKE_RUN_ERR:-}" FAKE_SLEEP_SECONDS="${FAKE_SLEEP_SECONDS:-}" FAKE_INSPECT_RC="${FAKE_INSPECT_RC:-}" FAKE_INSPECT_ERR="${FAKE_INSPECT_ERR:-}" FAKE_PULL_RC="${FAKE_PULL_RC:-}" FAKE_PULL_ERR="${FAKE_PULL_ERR:-}" FAKE_PG_RUN_RC="${FAKE_PG_RUN_RC:-}" FAKE_PG_RUN_ERR="${FAKE_PG_RUN_ERR:-}" "$@" bash --noprofile --norc -e -o pipefail "$TMP/smoke.sh") > "$ERR" 2>&1
   rc=$?
 }
 
@@ -330,14 +348,15 @@ t() {
 setup_states
 check "timeout with 000 codes included" t
 
-# deadline stops loop before max rounds
+# deadline stops loop before max rounds: a 4s timeout with a 1s poll allows
+# max_rounds=4, but each sleep really takes 2.5s, so the wall-clock deadline
+# is reached after about 3 rounds (12 curls), short of the 4 rounds (16 curls)
+# the round count alone would allow.
 t() {
-  SMOKE_TIMEOUT_SECONDS=1 SMOKE_POLL_SECONDS=2 FAKE_SLEEP_SECONDS=0.5 run_smoke
-  curl_rounds="$(wc -l < "$TMP/curl.log")"
-  # With 1s timeout and 2s poll interval, max_rounds = 0 (1/2), but loop always runs at least once
-  # So we expect < 4 paths * 2 rounds = 8 (the loop should stop by deadline after 1-2 seconds of real time)
-  # Actually, with sleep burning 0.5s per round, we'll get 1-2 rounds before hitting the 1s deadline
-  [[ "$rc" != 0 ]] && output_has "Timeout" && [[ "$curl_rounds" -lt 8 ]]
+  SMOKE_TIMEOUT_SECONDS=4 SMOKE_POLL_SECONDS=1 FAKE_SLEEP_SECONDS=2.5 run_smoke
+  curl_count="$(wc -l < "$TMP/curl.log")"
+  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Timeout waiting for healthy response" &&
+  [[ "$curl_count" -ge 4 ]] && [[ "$curl_count" -lt 16 ]]
 }
 : > "$TMP/codes"
 setup_states
@@ -363,6 +382,33 @@ t() {
   tail -1 "$TMP/docker.log" | grep -qF "smoke-postgres"
 }
 check "docker run fails" t
+
+# image inspect fails: annotation plus docker's error text, not swallowed into the JSON value
+t() {
+  FAKE_INSPECT_RC=1 FAKE_INSPECT_ERR='Error: No such image: smoke-test:local' run_smoke
+  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to inspect image" &&
+  output_has "Error: No such image: smoke-test:local" &&
+  ! docker_log_has "pull " && ! docker_log_has "run " && docker_log_has "rm -f"
+}
+check "image inspect fails with annotation and docker error" t
+
+# Postgres pull fails
+t() {
+  FAKE_PULL_RC=1 FAKE_PULL_ERR='toomanyrequests: rate limit' run_smoke
+  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to pull Postgres image" &&
+  output_has "toomanyrequests: rate limit" &&
+  ! docker_log_has "run " && tail -1 "$TMP/docker.log" | grep -qF "rm -f"
+}
+check "postgres pull fails with annotation" t
+
+# Postgres run fails
+t() {
+  FAKE_PG_RUN_RC=125 FAKE_PG_RUN_ERR='port is already allocated' run_smoke
+  [[ "$rc" != 0 ]] && output_has "::error title=Smoke test failed::Failed to start Postgres container" &&
+  output_has "port is already allocated" &&
+  ! docker_log_has "--name smoke-app" && tail -1 "$TMP/docker.log" | grep -qF "rm -f"
+}
+check "postgres run fails with annotation" t
 
 # postgres never ready
 t() {
@@ -399,74 +445,136 @@ echo "exited 135" > "$TMP/states"
 : > "$TMP/codes"
 check "GitHub annotation" t
 
-# ============ Structural checks for Task 2: wiring into build flow ============
 
-# Parse step blocks from the workflow (steps at 6 spaces, keys at 8, content at 10+).
-# For each step, extract: name, id (if any), if (if any), and uses/run marker.
+# ============ Structural checks: wiring into the build flow ============
+#
+# Step names are matched literally (never as regexes), so names with
+# parentheses behave the same under mawk and gawk.
 
-# Extract step name by pattern (returns first match or empty)
-step_name_line() {
-  awk -v pat="$1" '
-    /^      - name: / && $0 ~ pat { print; exit }
-  ' "$WORKFLOW"
+# step_block NAME [FILE]: print the lines of the step whose `- name:` line is
+# exactly "      - name: NAME", from that line up to (not including) the next
+# step at 6-space indent or any other non-comment line indented 6 or less.
+# Exits 2 when no such step exists.
+step_block() {
+  awk -v want="      - name: $1" '
+    started {
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) { print; next }
+      match($0, /^ */)
+      if (RLENGTH <= 6) { exit }
+      print
+      next
+    }
+    $0 == want { started = 1; found = 1; print }
+    END { if (!found) exit 2 }
+  ' "${2:-$WORKFLOW}"
 }
 
-# Extract step field value (name $1, field $2 like "id:" or "if:")
+# step_has_line NAME PREFIX [FILE]: 0 when a line of the step starts with the
+# literal PREFIX, 1 when the step exists without one, 2 when the step is missing.
+step_has_line() {
+  local block
+  block="$(step_block "$1" "${3:-$WORKFLOW}")" || return 2
+  printf '%s\n' "$block" | awk -v p="$2" 'index($0, p) == 1 { f = 1 } END { exit f ? 0 : 1 }'
+}
+
+# step_lacks_line NAME PREFIX [FILE]: true only when the step exists and has no
+# line starting with PREFIX.
+step_lacks_line() {
+  local st
+  step_has_line "$@"; st=$?
+  [[ "$st" == 1 ]]
+}
+
+# step_field NAME KEY [FILE]: value of the step's 8-space `KEY ` line (KEY
+# includes the colon, e.g. 'if:').
 step_field() {
-  awk -v step="$1" -v field="$2" '
-    /^      - / { in_step = 0 }
-    $0 ~ "^      - name: " step "$" { in_step = 1; next }
-    in_step && $0 ~ "^        " field " " {
-      line = $0
-      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
-      print line
+  step_block "$1" "${3:-$WORKFLOW}" | awk -v p="        $2 " '
+    index($0, p) == 1 { print substr($0, length(p) + 1); exit }
+  '
+}
+
+# step_with_value NAME ATTR [FILE]: value of `ATTR:` under the step's `with:`,
+# including continuation lines of a block scalar.
+step_with_value() {
+  step_block "$1" "${3:-$WORKFLOW}" | awk -v p="          $2:" '
+    $0 == "        with:" { in_with = 1; next }
+    in_with && /^        [^ ]/ { exit }
+    in_val {
+      if ($0 ~ /^[[:space:]]*$/ || index($0, "           ") == 1) { print; next }
       exit
     }
-  ' "$WORKFLOW"
+    in_with && (index($0, p " ") == 1 || $0 == p) {
+      v = substr($0, length(p) + 1); sub(/^ /, "", v); print v; in_val = 1
+    }
+  '
 }
 
-# Check that a uses: step has a specific attribute in its with: block
+# step_with_has NAME ATTR EXPECTED [FILE]
 step_with_has() {
-  local step_name="$1" attr="$2" expected="$3"
-  awk -v step="$step_name" -v attr="$attr" -v expected="$expected" '
-    /^      - / { in_step = 0; in_with = 0 }
-    $0 ~ "^      - name: " step "$" { in_step = 1; next }
-    in_step && /^        with:$/ { in_with = 1; next }
-    in_with && $0 ~ "^          " attr ": " {
-      sub(/^[[:space:]]*[^[:space:]]+:[[:space:]]*/, "")
-      if ($0 == expected) exit 0
-      else exit 1
-    }
-    in_with && /^        [^[:space:]]/ { exit 1 }
-  ' "$WORKFLOW"
+  [[ "$(step_with_value "$1" "$2" "${4:-$WORKFLOW}")" == "$3" ]]
+}
+
+SMOKE_BUILD='Build default stage for smoke test'
+SMOKE_STEP='Smoke test default stage'
+PUSH_BUILD='Build (push by digest) default stage'
+NOPUSH_BUILD='Build (no push) default stage'
+
+# inject_in_step NAME AFTER NEWLINE SRC: copy SRC, adding NEWLINE after the
+# first line equal to AFTER inside step NAME (AFTER empty: after the name line).
+inject_in_step() {
+  awk -v want="      - name: $1" -v after="$2" -v add="$3" '
+    { print }
+    done { next }
+    $0 == want { in_step = 1; if (after == "") { print add; done = 1 }; next }
+    in_step && /^      - / { in_step = 0 }
+    in_step && $0 == after { print add; done = 1 }
+    END { if (!done) exit 3 }
+  ' "$4"
+}
+
+# mutant NAME AFTER NEWLINE OUT: write a mutated copy of the workflow to OUT,
+# failing if the injection did not happen.
+mutant() {
+  inject_in_step "$1" "$2" "$3" "$WORKFLOW" > "$4" && ! cmp -s "$WORKFLOW" "$4"
 }
 
 # build_smoke exists with correct attributes
-t() {
-  [[ -n "$(step_name_line 'Build default stage for smoke test')" ]] &&
-  [[ "$(step_field 'Build default stage for smoke test' 'id:')" == "build_smoke" ]] &&
-  [[ "$(step_field 'Build default stage for smoke test' 'if:')" == "inputs.smokeTest" ]] &&
-  step_with_has 'Build default stage for smoke test' 'load' 'true' &&
-  step_with_has 'Build default stage for smoke test' 'push' 'false' &&
-  step_with_has 'Build default stage for smoke test' 'tags' 'smoke-test:local' &&
+build_smoke_attrs() {
+  local f="$1"
+  step_block "$SMOKE_BUILD" "$f" > /dev/null &&
+  [[ "$(step_field "$SMOKE_BUILD" 'id:' "$f")" == "build_smoke" ]] &&
+  [[ "$(step_field "$SMOKE_BUILD" 'if:' "$f")" == "inputs.smokeTest" ]] &&
+  step_with_has "$SMOKE_BUILD" 'load' 'true' "$f" &&
+  step_with_has "$SMOKE_BUILD" 'push' 'false' "$f" &&
+  step_with_has "$SMOKE_BUILD" 'tags' 'smoke-test:local' "$f" &&
   # No target: means additionalTarget is not used for smoke test
-  ! awk '/^      - name: Build default stage for smoke test$/,/^      - / {if(/^          target:/) exit 0} END{exit 1}' "$WORKFLOW" &&
+  step_lacks_line "$SMOKE_BUILD" '          target:' "$f" &&
   # cache-from scope matches default stage pattern
-  step_with_has 'Build default stage for smoke test' 'cache-from' "type=gha,scope=\${{ needs.prepare.outputs.image_slug }}-\${{ matrix.safe }}-default"
+  step_with_has "$SMOKE_BUILD" 'cache-from' "type=gha,scope=\${{ needs.prepare.outputs.image_slug }}-\${{ matrix.safe }}-default" "$f"
 }
+t() { build_smoke_attrs "$WORKFLOW"; }
 check "build_smoke exists with correct attributes" t
+
+# mutant: target: under build_smoke's with: must fail the check
+t() {
+  mutant "$SMOKE_BUILD" '        with:' '          target: x' "$TMP/mut-target.yaml" &&
+  ! step_lacks_line "$SMOKE_BUILD" '          target:' "$TMP/mut-target.yaml" &&
+  ! build_smoke_attrs "$TMP/mut-target.yaml"
+}
+check "mutant: build_smoke with target: fails the attributes check" t
 
 # smoke_test has if: inputs.smokeTest
 t() {
-  [[ "$(step_field 'Smoke test default stage' 'if:')" == "inputs.smokeTest" ]]
+  [[ "$(step_field "$SMOKE_STEP" 'id:')" == "smoke_test" ]] &&
+  [[ "$(step_field "$SMOKE_STEP" 'if:')" == "inputs.smokeTest" ]]
 }
 check "smoke_test has if: inputs.smokeTest" t
 
 # Step order: build_smoke < smoke_test < build_default_push
 t() {
-  build_smoke_line="$(grep -n '^      - name: Build default stage for smoke test$' "$WORKFLOW" | cut -d: -f1)"
-  smoke_test_line="$(grep -n '^      - name: Smoke test default stage$' "$WORKFLOW" | cut -d: -f1)"
-  build_push_line="$(grep -n '^      - name: Build (push by digest) default stage$' "$WORKFLOW" | cut -d: -f1)"
+  build_smoke_line="$(grep -nxF -- "      - name: $SMOKE_BUILD" "$WORKFLOW" | cut -d: -f1)"
+  smoke_test_line="$(grep -nxF -- "      - name: $SMOKE_STEP" "$WORKFLOW" | cut -d: -f1)"
+  build_push_line="$(grep -nxF -- "      - name: $PUSH_BUILD" "$WORKFLOW" | cut -d: -f1)"
   [[ -n "$build_smoke_line" ]] && [[ -n "$smoke_test_line" ]] && [[ -n "$build_push_line" ]] &&
   [[ "$build_smoke_line" -lt "$smoke_test_line" ]] &&
   [[ "$smoke_test_line" -lt "$build_push_line" ]]
@@ -475,7 +583,7 @@ check "step order: build_smoke < smoke_test < build_default_push" t
 
 # Build (no push) default stage has updated if:
 t() {
-  if_cond="$(step_field 'Build \(no push\) default stage' 'if:')"
+  if_cond="$(step_field "$NOPUSH_BUILD" 'if:')"
   [[ "$if_cond" == "needs.prepare.outputs.push != 'true' && !inputs.smokeTest" ]]
 }
 check "Build (no push) default stage has updated if condition" t
@@ -484,14 +592,14 @@ check "Build (no push) default stage has updated if condition" t
 # Expected if: lines (step name | if: condition) from origin/main, excluding the ones we change
 expected_ifs=(
   "Pre-build commands|inputs.preBuildCommands != ''"
-  "Inject version into package.json files \\(npm\\)|inputs.versionMode == 'npm' && steps.version.outputs.version != '' && inputs.versionFiles != ''"
-  "Prepare build args for .NET version \\(csproj\\)|inputs.versionMode == 'csproj' && steps.version.outputs.version != ''"
+  "Inject version into package.json files (npm)|inputs.versionMode == 'npm' && steps.version.outputs.version != '' && inputs.versionFiles != ''"
+  "Prepare build args for .NET version (csproj)|inputs.versionMode == 'csproj' && steps.version.outputs.version != ''"
   "Login to Docker Hub|needs.prepare.outputs.push == 'true'"
-  "Build \\(push by digest\\) default stage|needs.prepare.outputs.push == 'true'"
+  "Build (push by digest) default stage|needs.prepare.outputs.push == 'true'"
   "Export default digest|needs.prepare.outputs.push == 'true'"
   "Upload default digest|needs.prepare.outputs.push == 'true'"
-  "Build \\(push by digest\\) additional target|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
-  "Build \\(no push\\) additional target|needs.prepare.outputs.push != 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+  "Build (push by digest) additional target|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
+  "Build (no push) additional target|needs.prepare.outputs.push != 'true' && needs.prepare.outputs.has_additional_target == 'true'"
   "Export additional digest|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
   "Upload additional digest|needs.prepare.outputs.push == 'true' && needs.prepare.outputs.has_additional_target == 'true'"
 )
@@ -509,57 +617,52 @@ t() {
 }
 check "no other step if: changed from origin/main" t
 
-# build_smoke has no continue-on-error
-t() {
-  ! awk '/^      - name: Build default stage for smoke test$/,/^      - / {if(/^        continue-on-error:/) exit 0} END{exit 1}' "$WORKFLOW"
-}
+# build_smoke and smoke_test have no continue-on-error
+t() { step_lacks_line "$SMOKE_BUILD" '        continue-on-error:'; }
 check "build_smoke has no continue-on-error" t
 
-# smoke_test has no continue-on-error
-t() {
-  ! awk '/^      - name: Smoke test default stage$/,/^      - / {if(/^        continue-on-error:/) exit 0} END{exit 1}' "$WORKFLOW"
-}
+t() { step_lacks_line "$SMOKE_STEP" '        continue-on-error:'; }
 check "smoke_test has no continue-on-error" t
+
+# mutants: continue-on-error under each step must fail its check
+t() {
+  mutant "$SMOKE_BUILD" '' '        continue-on-error: true' "$TMP/mut-coe-build.yaml" &&
+  ! step_lacks_line "$SMOKE_BUILD" '        continue-on-error:' "$TMP/mut-coe-build.yaml"
+}
+check "mutant: build_smoke continue-on-error fails the check" t
+
+t() {
+  mutant "$SMOKE_STEP" '' '        continue-on-error: true' "$TMP/mut-coe-smoke.yaml" &&
+  ! step_lacks_line "$SMOKE_STEP" '        continue-on-error:' "$TMP/mut-coe-smoke.yaml"
+}
+check "mutant: smoke_test continue-on-error fails the check" t
+
+# continue-on-error on the step after smoke_test belongs to that step, not smoke_test
+t() {
+  mutant "$PUSH_BUILD" '' '        continue-on-error: true' "$TMP/mut-coe-next.yaml" &&
+  step_lacks_line "$SMOKE_STEP" '        continue-on-error:' "$TMP/mut-coe-next.yaml"
+}
+check "step block ends at the next step" t
+
+# a missing step is not reported as lacking the key
+t() {
+  step_has_line 'No such step' '        continue-on-error:'
+  [[ "$?" == 2 ]] && ! step_lacks_line 'No such step' '        continue-on-error:'
+}
+check "missing step is distinct from missing key" t
 
 # build_smoke and build_default_push have identical build attributes
 t() {
-  smoke_context="$(step_with_extract 'Build default stage for smoke test' 'context')"
-  push_context="$(step_with_extract 'Build \(push by digest\) default stage' 'context')"
-  smoke_file="$(step_with_extract 'Build default stage for smoke test' 'file')"
-  push_file="$(step_with_extract 'Build \(push by digest\) default stage' 'file')"
-  smoke_platforms="$(step_with_extract 'Build default stage for smoke test' 'platforms')"
-  push_platforms="$(step_with_extract 'Build \(push by digest\) default stage' 'platforms')"
-  smoke_pull="$(step_with_extract 'Build default stage for smoke test' 'pull')"
-  push_pull="$(step_with_extract 'Build \(push by digest\) default stage' 'pull')"
-  smoke_build_args="$(step_with_extract 'Build default stage for smoke test' 'build-args')"
-  push_build_args="$(step_with_extract 'Build \(push by digest\) default stage' 'build-args')"
-  smoke_labels="$(step_with_extract 'Build default stage for smoke test' 'labels')"
-  push_labels="$(step_with_extract 'Build \(push by digest\) default stage' 'labels')"
-  smoke_cache_from="$(step_with_extract 'Build default stage for smoke test' 'cache-from')"
-  push_cache_from="$(step_with_extract 'Build \(push by digest\) default stage' 'cache-from')"
-
-  [[ "$smoke_context" == "$push_context" ]] &&
-  [[ "$smoke_file" == "$push_file" ]] &&
-  [[ "$smoke_platforms" == "$push_platforms" ]] &&
-  [[ "$smoke_pull" == "$push_pull" ]] &&
-  [[ "$smoke_build_args" == "$push_build_args" ]] &&
-  [[ "$smoke_labels" == "$push_labels" ]] &&
-  [[ "$smoke_cache_from" == "$push_cache_from" ]]
-}
-# Helper to extract step with: attribute value
-step_with_extract() {
-  local step_name="$1" attr="$2"
-  awk -v step="$step_name" -v attr="$attr" '
-    /^      - / { in_step = 0; in_with = 0 }
-    $0 ~ "^      - name: " step "$" { in_step = 1; next }
-    in_step && /^        with:$/ { in_with = 1; next }
-    in_with && $0 ~ "^          " attr ": " {
-      sub(/^[[:space:]]*[^[:space:]]+:[[:space:]]*/, "")
-      print
-      exit
-    }
-    in_with && /^        [^[:space:]]/ { exit 1 }
-  ' "$WORKFLOW"
+  local attr smoke push
+  for attr in context file platforms pull build-args labels cache-from cache-to; do
+    smoke="$(step_with_value "$SMOKE_BUILD" "$attr")"
+    push="$(step_with_value "$PUSH_BUILD" "$attr")"
+    if [[ -z "$smoke" || "$smoke" != "$push" ]]; then
+      echo "with.$attr differs or is missing" >&2
+      return 1
+    fi
+  done
+  return 0
 }
 check "build_smoke and build_default_push have identical build attributes" t
 
