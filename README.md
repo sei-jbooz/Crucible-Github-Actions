@@ -308,6 +308,40 @@ The action belongs to the `nuget` release family, so pin it with the same `nuget
 | `buildArgs` |  | Optional Docker build args (newline-separated `key=value`). |
 | `platforms` |  | Comma-separated target platforms; default `linux/amd64,linux/arm64`. |
 | `preBuildCommands` |  | Optional shell commands to run before the Docker build (e.g., fetch artifacts). |
+| `smokeTest` |  | Run a startup smoke test after building the default stage; default `true`. |
+| `smokeTestPath` |  | Health endpoint path to check (must start with `/`). Empty means try the default list. |
+| `smokeTestEnv` |  | Additional environment variables for the smoke test (newline-separated `KEY=VALUE`, applied after defaults). |
+
+#### Startup smoke test
+
+The workflow runs a startup smoke test by default (`smokeTest: true`) for every platform before pushing the image. The test starts a throwaway Postgres container (`postgres:17.6`) in a shared network namespace with the built image, polls the app's health endpoints for up to 120 seconds, and fails the job if the container exits or does not respond with HTTP 200 within the timeout.
+
+The app runs with these environment variables (in this order), then `smokeTestEnv`:
+
+- `Database__Provider=PostgreSQL`
+- `ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=smoketest;Username=postgres;Password=smoketest`
+- `Database__ConnectionString=` (same connection string)
+- `Oidc__RequireHttpsMetadata=false`
+- `GameEngine__ClientId=smoketest`
+- `GameEngine__ClientSecret=smoketest`
+
+The port is the numerically lowest TCP entry of the image's `ExposedPorts`; if none, port 8080. When `smokeTestPath` is set, only that path is checked; otherwise the test tries `/api/health/ready`, `/api/health/version`, `/api/status`, `/` and succeeds on the first 200.
+
+On failure the test prints the last 200 lines of the container's logs in a collapsed group. Only the default stage is tested; `additionalTarget` and `debug` images are not smoke tested.
+
+To opt out, set `smokeTest: false`:
+
+```yaml
+jobs:
+  docker:
+    uses: cmu-sei/Crucible-Github-Actions/.github/workflows/docker-build.yaml@docker-v1
+    with:
+      imageName: cmusei/myapp
+      smokeTest: false
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+```
 
 #### Required Secrets
 

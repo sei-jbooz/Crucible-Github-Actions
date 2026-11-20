@@ -4,11 +4,12 @@
 # Each platform builds on its native GitHub-hosted runner (amd64 on
 # ubuntu-24.04, arm64 on ubuntu-24.04-arm) in parallel.
 #
-# Push path: each build job pushes by digest only (no tags); the merge
-# job then assembles a multi-arch manifest list over those digests with
-# `docker buildx imagetools create` and applies the final tag set.
-# No-push path (PRs, explicit push=false): builds run for validation
-# only and merge is skipped entirely.
+# On the push path each build job: builds the default stage with load, runs
+# a startup smoke test against the loaded image (default on, opt-out with
+# smokeTest: false), then pushes by digest only (no tags); the merge job
+# assembles a multi-arch manifest list over those digests and applies the
+# final tag set. No-push path (PRs, explicit push=false): builds and tests
+# run for validation only and merge is skipped entirely.
 
 name: Build & Publish Image
 
