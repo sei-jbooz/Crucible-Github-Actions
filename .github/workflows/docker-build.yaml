@@ -353,18 +353,28 @@ jobs:
             fi
           fi
 
-          # Validate STARTUP_TEST_ENV
+          # Write the env file: defaults first, then the validated caller env
+          # (CR stripped, blank lines skipped), so caller values override.
+          env_file="$RUNNER_TEMP/startup-test.env"
+          {
+            echo "Database__Provider=PostgreSQL"
+            echo "ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest"
+            echo "Database__ConnectionString=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest"
+            echo "Oidc__RequireHttpsMetadata=false"
+            echo "GameEngine__ClientId=startuptest"
+            echo "GameEngine__ClientSecret=startuptest"
+          } > "$env_file"
           if [[ -n "$STARTUP_TEST_ENV" ]]; then
             line_num=0
             while IFS= read -r line; do
               line_num=$((line_num + 1))
-              # Strip CR and skip blank lines
               line="${line%$'\r'}"
               [[ -z "$line" ]] && continue
               if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_.]*= ]]; then
                 echo "::error title=Startup test failed::Invalid env line $line_num"
                 exit 1
               fi
+              echo "$line" >> "$env_file"
             done <<< "$STARTUP_TEST_ENV"
           fi
 
@@ -430,26 +440,6 @@ jobs:
             echo "::endgroup::"
             echo "::error title=Startup test failed::Postgres failed to become ready"
             exit 1
-          fi
-
-          # Write env file with defaults then caller env
-          env_file="$RUNNER_TEMP/startup-test.env"
-          {
-            echo "Database__Provider=PostgreSQL"
-            echo "ConnectionStrings__PostgreSQL=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest"
-            echo "Database__ConnectionString=Server=localhost;Port=5432;Database=startuptest;Username=postgres;Password=startuptest"
-            echo "Oidc__RequireHttpsMetadata=false"
-            echo "GameEngine__ClientId=startuptest"
-            echo "GameEngine__ClientSecret=startuptest"
-          } > "$env_file"
-
-          # Append caller env (strip CR, skip blank lines)
-          if [[ -n "$STARTUP_TEST_ENV" ]]; then
-            while IFS= read -r line; do
-              line="${line%$'\r'}"
-              [[ -z "$line" ]] && continue
-              echo "$line" >> "$env_file"
-            done <<< "$STARTUP_TEST_ENV"
           fi
 
           # Start the app
